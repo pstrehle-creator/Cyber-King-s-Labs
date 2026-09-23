@@ -12,6 +12,7 @@ Usage:
     python cert_monitor.py check --targets-file targets.txt --email --slack
     python cert_monitor.py history
     python cert_monitor.py history example.com --limit 10
+    python cert_monitor.py discover example.com --targets-file targets.txt
     python cert_monitor.py ack example.com --note 'renewing today'
     python cert_monitor.py prune --keep-days 90
     python cert_monitor.py user add alice --role admin
@@ -41,6 +42,7 @@ from pathlib import Path
 import waitress
 from cryptography import x509
 
+import ct
 import dashboard
 import storage
 
@@ -250,26 +252,16 @@ def _slack_escape(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _default_title(alerts: list) -> str:
-    return f"{len(alerts)} certificate(s) need attention"
-
-
-def send_alert_slack(
-    alerts: list[tuple[CertCheckResult, str]],
-    url_var: str = "SLACK_WEBHOOK_URL",
-    title: str | None = None,
-) -> bool:
+def send_slack(title: str, lines: list[str], url_var: str = "SLACK_WEBHOOK_URL") -> bool:
     url = os.environ.get(url_var)
     if not url:
-        print(f"[warn] skipping Slack alert, missing env var: {url_var}", file=sys.stderr)
+        print(f"[warn] skipping Slack message, missing env var: {url_var}", file=sys.stderr)
         return False
     if not url.startswith("https://"):
-        print(f"[warn] skipping Slack alert, {url_var} must be an https:// URL", file=sys.stderr)
+        print(f"[warn] skipping Slack message, {url_var} must be an https:// URL", file=sys.stderr)
         return False
 
-    text = f"*cert-monitor: {title or _default_title(alerts)}*\n" + _slack_escape(
-        "\n".join(format_alert_lines(alerts))
-    )
+    text = f"*cert-monitor: {_slack_escape(title)}*\n" + _slack_escape("\n".join(lines))
     request = urllib.request.Request(
         url,
         data=json.dumps({"text": text}).encode(),
@@ -280,18 +272,14 @@ def send_alert_slack(
         with urllib.request.urlopen(request, timeout=10) as response:
             response.read()
     except (urllib.error.URLError, OSError) as exc:
-        print(f"[error] failed to send Slack alert, will retry next run: {exc}", file=sys.stderr)
+        print(f"[error] failed to send Slack message, will retry next run: {exc}", file=sys.stderr)
         return False
 
-    print("[info] Slack alert sent")
+    print("[info] Slack message sent")
     return True
 
 
-def send_alert_email(
-    alerts: list[tuple[CertCheckResult, str]],
-    to_var: str = "ALERT_TO_EMAILS",
-    title: str | None = None,
-) -> bool:
+def send_email(title: str, lines: list[str], to_var: str = "ALERT_TO_EMAILS") -> bool:
     smtp_host = os.environ.get("SMTP_HOST")
     smtp_port = int(os.environ.get("SMTP_PORT", "587"))
     smtp_user = os.environ.get("SMTP_USER")
@@ -309,17 +297,14 @@ def send_alert_email(
         if not val
     ]
     if missing:
-        print(f"[warn] skipping email alert, missing env vars: {', '.join(missing)}", file=sys.stderr)
+        print(f"[warn] skipping email, missing env vars: {', '.join(missing)}", file=sys.stderr)
         return False
-
-    title = title or _default_title(alerts)
-    body = f"{title}:\n\n" + "\n".join(format_alert_lines(alerts))
 
     msg = EmailMessage()
     msg["Subject"] = f"[cert-monitor] {title}"
     msg["From"] = from_addr
     msg["To"] = ", ".join(to_addrs)
-    msg.set_content(body)
+    msg.set_content(f"{title}:\n\n" + "\n".join(lines))
 
     try:
         with smtplib.SMTP(smtp_host, smtp_port, timeout=10) as server:
@@ -328,11 +313,31 @@ def send_alert_email(
                 server.login(smtp_user, smtp_password)
             server.send_message(msg)
     except (smtplib.SMTPException, OSError) as exc:
-        print(f"[error] failed to send alert email, will retry next run: {exc}", file=sys.stderr)
+        print(f"[error] failed to send email, will retry next run: {exc}", file=sys.stderr)
         return False
 
-    print(f"[info] alert email sent to {', '.join(to_addrs)}")
+    print(f"[info] email sent to {', '.join(to_addrs)}")
     return True
+
+
+def _default_title(alerts: list) -> str:
+    return f"{len(alerts)} certificate(s) need attention"
+
+
+def send_alert_slack(
+    alerts: list[tuple[CertCheckResult, str]],
+    url_var: str = "SLACK_WEBHOOK_URL",
+    title: str | None = None,
+) -> bool:
+    return send_slack(title or _default_title(alerts), format_alert_lines(alerts), url_var)
+
+
+def send_alert_email(
+    alerts: list[tuple[CertCheckResult, str]],
+    to_var: str = "ALERT_TO_EMAILS",
+    title: str | None = None,
+) -> bool:
+    return send_email(title or _default_title(alerts), format_alert_lines(alerts), to_var)
 
 
 NOTIFIERS = {"email": send_alert_email, "slack": send_alert_slack}
@@ -458,6 +463,117 @@ def cmd_history(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
             return 0
         print_table([dict(r) for r in rows], show_time=True)
     return 0
+
+
+CT_NOTIFIERS = {"email": send_email, "slack": send_slack}
+
+
+def format_ct_lines(rows) -> list[str]:
+    return [
+        f"- {', '.join(json.loads(row['names']))}\n"
+        f"    issued by {row['issuer']}, valid from {row['not_before']}\n"
+        f"    {ct.CRTSH_URL}?id={row['crtsh_id']}"
+        for row in rows
+    ]
+
+
+def _print_ct_hostnames(certs: list[ct.CTCertificate], monitored: set[str]) -> None:
+    latest: dict[str, ct.CTCertificate] = {}
+    for cert in certs:
+        for name in cert.names:
+            if name not in latest or cert.not_after > latest[name].not_after:
+                latest[name] = cert
+    if not latest:
+        return
+    width = max(len("HOSTNAME"), *map(len, latest))
+    print(f"{'HOSTNAME':<{width}}  {'STATUS':<13}  {'EXPIRES':<25}  ISSUER")
+    for name in sorted(latest, key=lambda n: (n.removeprefix("*.").split(".")[::-1], n)):
+        if name.startswith("*."):
+            status = "wildcard"
+        elif name in monitored:
+            status = "monitored"
+        else:
+            status = "NOT MONITORED"
+        cert = latest[name]
+        print(f"{name:<{width}}  {status:<13}  {cert.not_after:<25}  {cert.issuer}")
+
+
+def _append_targets(path: Path, hostnames: list[str]) -> None:
+    existing = path.read_text() if path.exists() else ""
+    separator = "" if not existing or existing.endswith("\n") else "\n"
+    today = datetime.now(timezone.utc).date().isoformat()
+    with path.open("a") as f:
+        f.write(f"{separator}# added by 'discover' on {today}\n")
+        f.writelines(f"{name}\n" for name in hostnames)
+
+
+def cmd_discover(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
+    try:
+        domains = list(dict.fromkeys(ct.normalize_domain(d) for d in args.domains))
+    except ValueError as exc:
+        args.parser.error(str(exc))
+    if args.add and not args.targets_file:
+        args.parser.error("--add needs --targets-file")
+
+    monitored = storage.monitored_hostnames(conn)
+    if args.targets_file and args.targets_file.exists():
+        monitored |= {split_target(t)[0].lower() for t in parse_targets_file(args.targets_file)}
+
+    lookup_failed = False
+    found_new = False
+    unmonitored: set[str] = set()
+    for domain in domains:
+        try:
+            certs = ct.fetch_certificates(domain, timeout=args.timeout)
+        except ct.CTLookupError as exc:
+            print(f"[error] {exc}", file=sys.stderr)
+            lookup_failed = True
+            continue
+
+        first_run = storage.ct_domain(conn, domain) is None
+        new = storage.save_ct_certs(conn, domain, certs, _utc_now_iso(), in_baseline=first_run)
+        conn.commit()
+
+        print(f"{domain}: {len(certs)} unexpired certificate(s) in CT logs")
+        _print_ct_hostnames(certs, monitored)
+        if first_run:
+            print(
+                f"[info] first run for {domain}: these are now the baseline; "
+                "later runs will report certificates issued after this one"
+            )
+        elif new:
+            found_new = True
+            print(f"[info] {len(new)} certificate(s) issued since the last run:")
+            for _, cert in new:
+                print(f"  {', '.join(cert.names)}  (issued by {cert.issuer}, {cert.url})")
+        print()
+        unmonitored |= {
+            name for cert in certs for name in cert.names
+            if not name.startswith("*.") and name not in monitored
+        }
+
+    if args.add and unmonitored:
+        _append_targets(args.targets_file, sorted(unmonitored))
+        print(f"[info] added {len(unmonitored)} hostname(s) to {args.targets_file}")
+
+    for channel in (c for c in CT_NOTIFIERS if getattr(args, c)):
+        rows = storage.unnotified_ct_certs(conn, domains, channel)
+        if not rows:
+            continue
+        title = f"{len(rows)} new certificate(s) issued for your domains"
+        lines = [
+            "Certificate Transparency logs show these certificates were issued since the last check.",
+            "If you don't recognize one, investigate: it may have been issued without your approval.",
+            "",
+            *format_ct_lines(rows),
+        ]
+        if CT_NOTIFIERS[channel](title, lines):
+            storage.mark_ct_notified(conn, [r["id"] for r in rows], channel, _utc_now_iso())
+            conn.commit()
+
+    if lookup_failed:
+        return 2
+    return 1 if found_new else 0
 
 
 def cmd_ack(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
@@ -624,6 +740,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     history.add_argument("target", nargs="?", help="host or host:port to show history for")
     history.add_argument("--limit", type=int, default=20, help="max rows for one target (default: 20)")
     history.set_defaults(func=cmd_history)
+
+    discover = subparsers.add_parser(
+        "discover", parents=[common],
+        help="find certificates for your domains in Certificate Transparency logs (via crt.sh)",
+    )
+    discover.add_argument("domains", nargs="+", metavar="DOMAIN", help="e.g. example.com")
+    discover.add_argument(
+        "--targets-file", type=Path, help="also count hostnames in this file as monitored"
+    )
+    discover.add_argument(
+        "--add", action="store_true", help="append hostnames that aren't monitored yet to --targets-file"
+    )
+    discover.add_argument(
+        "--timeout", type=float, default=60, help="crt.sh request timeout in seconds (default: 60)"
+    )
+    discover.add_argument("--email", action="store_true", help="email a report of newly issued certificates")
+    discover.add_argument("--slack", action="store_true", help="post newly issued certificates to Slack")
+    discover.set_defaults(func=cmd_discover, parser=discover)
 
     ack = subparsers.add_parser(
         "ack", parents=[common], help="acknowledge a target's open alert so it isn't escalated"

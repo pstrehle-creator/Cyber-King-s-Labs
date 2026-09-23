@@ -243,6 +243,49 @@ been renewed, that's a new alert and needs a new acknowledgement.
 Similarly, if a problem clears up and later comes back, the old
 acknowledgement doesn't carry over.
 
+## Finding certificates in Certificate Transparency logs
+
+Every publicly trusted certificate is recorded in public Certificate
+Transparency (CT) logs. `discover` searches those logs through
+[crt.sh](https://crt.sh) for your domains and their subdomains:
+
+```bash
+python cert_monitor.py discover example.com example.org --targets-file targets.txt
+```
+
+```
+example.com: 4 unexpired certificate(s) in CT logs
+HOSTNAME           STATUS         EXPIRES                    ISSUER
+example.com        monitored      2026-11-20T23:59:59+00:00  C=US, O=Let's Encrypt, CN=R11
+*.example.com      wildcard       2026-12-01T12:00:00+00:00  C=US, O=DigiCert Inc, CN=DigiCert ...
+mail.example.com   NOT MONITORED  2026-10-30T08:14:02+00:00  C=US, O=Let's Encrypt, CN=R11
+www.example.com    monitored      2026-11-20T23:59:59+00:00  C=US, O=Let's Encrypt, CN=R11
+```
+
+It helps in two ways:
+
+- **Finding hosts you forgot to monitor.** Any hostname with a certificate
+  that isn't in your targets file (or already checked) shows as
+  `NOT MONITORED`. Add `--add` to append those hostnames to
+  `--targets-file`. Wildcard names like `*.example.com` can't be checked
+  directly, so they're only listed. Review what `--add` wrote, since not
+  every hostname with a certificate serves HTTPS on port 443.
+- **Spotting certificates you didn't request.** The first run for a domain
+  records every current certificate as a baseline. Each later run reports
+  certificates issued since the previous run. If one appears that nobody
+  on your team requested, someone may have obtained a certificate for your
+  domain to impersonate it. Add `--email` and/or `--slack` to be told about
+  each new certificate once. Failed sends are retried on the next run.
+
+`discover` exits with `0` if nothing new was found, `1` if new certificates
+appeared, and `2` if a crt.sh lookup failed. A failed lookup records
+nothing, so a partial answer is never mistaken for the full list.
+
+crt.sh is a free public service and is often slow or briefly unavailable.
+Run `discover` once a day rather than every few minutes, and expect the
+occasional failed run. Very large domains may return more results than
+crt.sh (or the 50 MB response limit here) can handle.
+
 ## Running on a schedule (cron)
 
 Put the SMTP and Slack settings in a file that only you can read, so they're not in
@@ -266,6 +309,8 @@ Then add a crontab entry with `crontab -e`:
 ```cron
 # every 6 hours; alerts are only sent when something changes
 0 */6 * * * . $HOME/.cert-monitor.env && cd /path/to/cert-monitor && ./venv/bin/python cert_monitor.py check --targets-file targets.txt --email --slack --escalate-after 24 >> cert_monitor.log 2>&1
+# daily at 6am, look for new certificates issued for your domains
+0 6 * * * . $HOME/.cert-monitor.env && cd /path/to/cert-monitor && ./venv/bin/python cert_monitor.py discover example.com --targets-file targets.txt --email --slack >> cert_monitor.log 2>&1
 # weekly on Sunday at 3am, trim history older than 90 days
 0 3 * * 0 cd /path/to/cert-monitor && ./venv/bin/python cert_monitor.py prune --keep-days 90 >> cert_monitor.log 2>&1
 ```

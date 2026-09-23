@@ -58,6 +58,32 @@ CREATE TABLE IF NOT EXISTS acks (
 );
 CREATE INDEX IF NOT EXISTS idx_acks_target ON acks (target_id, id);
 
+CREATE TABLE IF NOT EXISTS ct_domains (
+    domain TEXT PRIMARY KEY,
+    baselined_at TEXT NOT NULL,
+    last_run_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ct_certs (
+    id INTEGER PRIMARY KEY,
+    cert_key TEXT NOT NULL UNIQUE,
+    domain TEXT NOT NULL,
+    crtsh_id INTEGER NOT NULL,
+    issuer TEXT,
+    names TEXT NOT NULL,
+    not_before TEXT NOT NULL,
+    not_after TEXT NOT NULL,
+    first_seen_at TEXT NOT NULL,
+    in_baseline INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ct_notified (
+    cert_id INTEGER NOT NULL REFERENCES ct_certs(id),
+    channel TEXT NOT NULL,
+    notified_at TEXT NOT NULL,
+    PRIMARY KEY (cert_id, channel)
+);
+
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY,
     username TEXT NOT NULL UNIQUE,
@@ -304,3 +330,61 @@ def target_alerts(conn: sqlite3.Connection, target_id: int, limit: int) -> list[
         "SELECT * FROM alerts WHERE target_id = ? ORDER BY id DESC LIMIT ?",
         (target_id, limit),
     ).fetchall()
+
+
+def monitored_hostnames(conn: sqlite3.Connection) -> set[str]:
+    return {row["hostname"].lower() for row in conn.execute("SELECT hostname FROM targets")}
+
+
+def ct_domain(conn: sqlite3.Connection, domain: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM ct_domains WHERE domain = ?", (domain,)).fetchone()
+
+
+def save_ct_certs(conn: sqlite3.Connection, domain: str, certs, seen_at: str, in_baseline: bool) -> list:
+    """Record certificates not seen before; returns (id, cert) for each new one."""
+    new = []
+    for cert in certs:
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO ct_certs (
+                cert_key, domain, crtsh_id, issuer, names, not_before, not_after, first_seen_at, in_baseline
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                cert.key, domain, cert.crtsh_id, cert.issuer, json.dumps(list(cert.names)),
+                cert.not_before, cert.not_after, seen_at, int(in_baseline),
+            ),
+        )
+        if cursor.rowcount:
+            new.append((cursor.lastrowid, cert))
+    conn.execute(
+        """
+        INSERT INTO ct_domains (domain, baselined_at, last_run_at) VALUES (?, ?, ?)
+        ON CONFLICT (domain) DO UPDATE SET last_run_at = excluded.last_run_at
+        """,
+        (domain, seen_at, seen_at),
+    )
+    return new
+
+
+def unnotified_ct_certs(conn: sqlite3.Connection, domains: list[str], channel: str) -> list[sqlite3.Row]:
+    """Newly issued (non-baseline) certificates for these domains that haven't
+    been reported on `channel` yet."""
+    placeholders = ",".join("?" * len(domains))
+    return conn.execute(
+        f"""
+        SELECT * FROM ct_certs c
+        WHERE c.in_baseline = 0
+          AND c.domain IN ({placeholders})
+          AND NOT EXISTS (SELECT 1 FROM ct_notified n WHERE n.cert_id = c.id AND n.channel = ?)
+        ORDER BY c.id
+        """,
+        (*domains, channel),
+    ).fetchall()
+
+
+def mark_ct_notified(conn: sqlite3.Connection, cert_ids: list[int], channel: str, notified_at: str) -> None:
+    conn.executemany(
+        "INSERT OR IGNORE INTO ct_notified (cert_id, channel, notified_at) VALUES (?, ?, ?)",
+        [(cert_id, channel, notified_at) for cert_id in cert_ids],
+    )
