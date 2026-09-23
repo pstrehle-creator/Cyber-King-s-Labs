@@ -283,8 +283,50 @@ def get_alert_state(conn: sqlite3.Connection, target_id: int) -> dict[str, str]:
     return {row["channel"]: row["alert_key"] for row in rows}
 
 
+# A PagerDuty incident stays open until it's explicitly resolved, so when a
+# target recovers (or is removed) its "pagerduty" state becomes a pending
+# resolve that's retried until PagerDuty accepts it.
+PAGERDUTY_RESOLVE = "pagerduty:resolve"
+
+
 def clear_alert_state(conn: sqlite3.Connection, target_id: int) -> None:
-    conn.execute("DELETE FROM alert_state WHERE target_id = ?", (target_id,))
+    had_incident = conn.execute(
+        "SELECT 1 FROM alert_state WHERE target_id = ? AND channel = 'pagerduty'", (target_id,)
+    ).fetchone()
+    conn.execute(
+        "DELETE FROM alert_state WHERE target_id = ? AND channel != ?", (target_id, PAGERDUTY_RESOLVE)
+    )
+    if had_incident:
+        conn.execute(
+            "INSERT OR REPLACE INTO alert_state (target_id, channel, alert_key, alerted_at) VALUES (?, ?, 'RESOLVE', ?)",
+            (target_id, PAGERDUTY_RESOLVE, _utc_now_iso()),
+        )
+
+
+def cancel_pagerduty_resolve(conn: sqlite3.Connection, target_id: int) -> None:
+    conn.execute(
+        "DELETE FROM alert_state WHERE target_id = ? AND channel = ?", (target_id, PAGERDUTY_RESOLVE)
+    )
+
+
+def pending_pagerduty_resolves(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT t.id AS target_id, t.hostname, t.port, t.protocol
+        FROM alert_state s JOIN targets t ON t.id = s.target_id
+        WHERE s.channel = ?
+        ORDER BY t.hostname, t.port
+        """,
+        (PAGERDUTY_RESOLVE,),
+    ).fetchall()
+
+
+def finish_pagerduty_resolve(conn: sqlite3.Connection, target_id: int, at: str) -> None:
+    cancel_pagerduty_resolve(conn, target_id)
+    conn.execute(
+        "INSERT INTO alerts (target_id, alert_key, channel, sent_at) VALUES (?, 'RESOLVED', 'pagerduty', ?)",
+        (target_id, at),
+    )
 
 
 def record_alert(
@@ -302,11 +344,11 @@ def record_alert(
 
 def active_alert(conn: sqlite3.Connection, target_id: int) -> tuple[str, str] | None:
     """The alert currently open for a target, as (alert_key, first sent at),
-    based on the regular (non-escalation) channels."""
+    based on the regular channels (not escalations or pending resolves)."""
     rows = conn.execute(
         """
         SELECT alert_key, alerted_at FROM alert_state
-        WHERE target_id = ? AND channel NOT LIKE '%:escalation'
+        WHERE target_id = ? AND channel NOT LIKE '%:%'
         ORDER BY alerted_at DESC
         """,
         (target_id,),

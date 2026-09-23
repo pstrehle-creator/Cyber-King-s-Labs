@@ -1,9 +1,9 @@
 # cert-monitor
 
-A tool that checks TLS certificate expiry for a list of hosts, keeps a
-history of every check in SQLite, alerts admins by email and Slack before
-certificates lapse, and shows everything on a web dashboard with admin and
-viewer accounts. Admins acknowledge alerts, and unacknowledged urgent ones
+A tool that checks TLS certificate expiry for web and mail servers, keeps
+a history of every check in SQLite, alerts admins by email, Slack,
+Microsoft Teams or PagerDuty before certificates lapse, and shows
+everything on a web dashboard with admin and viewer accounts. Admins acknowledge alerts, and unacknowledged urgent ones
 escalate. It can also search Certificate Transparency logs to find hosts
 you aren't monitoring and certificates you didn't request.
 
@@ -266,6 +266,49 @@ your channel. Text taken from certificates is escaped before posting, so a
 hostile server can't put `@channel` pings or disguised links into your
 alerts.
 
+## Microsoft Teams alerts
+
+With `--teams`, alerts are posted to a Teams channel as an Adaptive Card.
+In Teams, use the **Workflows** app to create a workflow that posts to a
+channel when a webhook request is received, and copy its URL:
+
+```bash
+export TEAMS_WEBHOOK_URL='https://...'
+python cert_monitor.py check --teams
+```
+
+This uses the Workflows webhook format. Microsoft is retiring the older
+"Incoming Webhook" connectors, and their URLs may not accept these cards.
+Teams follows the same once-per-state-change rules and retry behaviour as
+the other channels, and `discover --teams` posts newly issued
+certificates. Text from certificates is sent as plain text, so a hostile
+server can't turn it into links or formatting in your channel.
+
+## PagerDuty
+
+With `--pagerduty`, each host with a problem opens a PagerDuty incident
+through the [Events API v2](https://developer.pagerduty.com/docs/events-api-v2/overview).
+Add an "Events API v2" integration to a PagerDuty service and use its
+integration key:
+
+```bash
+export PAGERDUTY_ROUTING_KEY='your-integration-key'
+# EU accounts: export PAGERDUTY_EVENTS_URL=https://events.eu.pagerduty.com/v2/enqueue
+python cert_monitor.py check --pagerduty
+```
+
+- **One incident per host:** if the problem gets worse (a 14-day warning
+  becomes a 7-day warning, then `EXPIRED`), the same incident is updated
+  instead of opening a new one.
+- **Severity:** `critical` for an expired certificate, `error` for an
+  invalid chain, an unreachable host, or 7 days or fewer left, and
+  `warning` for earlier expiry warnings.
+- **Automatic resolve:** when the host is healthy again, or you stop
+  monitoring it, the incident is resolved on the next `check --pagerduty`
+  run. A failed resolve is retried on every run until PagerDuty accepts
+  it. The target page on the dashboard shows each resolve in its alert
+  log.
+
 ## Acknowledging and escalating alerts
 
 When an admin sees an alert and starts handling it, they **acknowledge**
@@ -283,7 +326,7 @@ alert from being **escalated**. To turn escalation on, add
 ```bash
 export ESCALATION_EMAILS=it-manager@example.com
 export ESCALATION_SLACK_WEBHOOK_URL='https://hooks.slack.com/services/...'   # e.g. a #ops-escalations channel
-python cert_monitor.py check --targets-file targets.txt --email --slack --escalate-after 24
+python cert_monitor.py check --email --slack --escalate-after 24
 ```
 
 An alert is escalated when all of these are true:
@@ -296,7 +339,12 @@ An alert is escalated when all of these are true:
 - **Nobody has acknowledged it.**
 
 Escalations go through the same channels you enabled for regular alerts,
-but to the escalation contacts instead. Each alert is escalated once.
+but to the escalation contacts instead (`ESCALATION_EMAILS`,
+`ESCALATION_SLACK_WEBHOOK_URL`, `ESCALATION_TEAMS_WEBHOOK_URL`). Each
+alert is escalated once. PagerDuty is the exception: its incidents
+escalate through PagerDuty's own escalation policies, and an
+acknowledgement in cert-monitor doesn't acknowledge the PagerDuty
+incident.
 
 An acknowledgement covers one alert at one stage. If a certificate moves
 on to its next expiry warning (say from 7 days to 3 days) and still hasn't
@@ -350,8 +398,8 @@ crt.sh (or the 50 MB response limit here) can handle.
 
 ## Running on a schedule (cron)
 
-Put the SMTP and Slack settings in a file that only you can read, so they're not in
-the crontab itself:
+Put the alert settings in a file that only you can read, so they're not
+in the crontab itself:
 
 ```bash
 cat > ~/.cert-monitor.env <<'EOF'
@@ -362,6 +410,8 @@ export ALERT_FROM_EMAIL=alerts@example.com
 export ALERT_TO_EMAILS=admin1@example.com,admin2@example.com
 export SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...
 export ESCALATION_EMAILS=it-manager@example.com
+export TEAMS_WEBHOOK_URL=https://...
+export PAGERDUTY_ROUTING_KEY=your-integration-key
 EOF
 chmod 600 ~/.cert-monitor.env
 ```
@@ -370,7 +420,7 @@ Then add a crontab entry with `crontab -e`:
 
 ```cron
 # every 6 hours; alerts are only sent when something changes
-0 */6 * * * . $HOME/.cert-monitor.env && cd /path/to/cert-monitor && ./venv/bin/python cert_monitor.py check --email --slack --escalate-after 24 >> cert_monitor.log 2>&1
+0 */6 * * * . $HOME/.cert-monitor.env && cd /path/to/cert-monitor && ./venv/bin/python cert_monitor.py check --email --slack --teams --pagerduty --escalate-after 24 >> cert_monitor.log 2>&1
 # daily at 6am, look for new certificates issued for your domains
 0 6 * * * . $HOME/.cert-monitor.env && cd /path/to/cert-monitor && ./venv/bin/python cert_monitor.py discover example.com --email --slack >> cert_monitor.log 2>&1
 # weekly on Sunday at 3am, trim history older than 90 days
@@ -395,20 +445,20 @@ Setup:
 
 ```bash
 cd cert-monitor
-cp .env.example .env    # fill in SMTP/Slack settings and DASHBOARD_SECRET_KEY
+cp .env.example .env    # fill in alert settings and DASHBOARD_SECRET_KEY
 docker compose build
 docker compose run --rm dashboard python cert_monitor.py user add alice --role admin
 docker compose up -d
 ```
 
-Then add hosts on the dashboard's Hosts page, or import a list:
+Then open <http://127.0.0.1:8080>, sign in, and add hosts on the Hosts
+page, or import a list:
 
 ```bash
 docker compose exec -T dashboard python cert_monitor.py targets import - --by alice < my-hosts.txt
 ```
 
-Then open <http://127.0.0.1:8080>. Other commands run inside a container
-the same way:
+Other commands run inside a container the same way:
 
 ```bash
 docker compose exec dashboard python cert_monitor.py history
@@ -422,7 +472,7 @@ Things to know:
 - **Configuration:** `.env` holds your secrets, so keep it out of version
   control (it's already in `.gitignore`). The scheduler's `CHECK_ARGS` and
   `DISCOVER_ARGS` settings are the extra options passed to `check` and
-  `discover`, e.g. `--email --slack --escalate-after 24`.
+  `discover`, e.g. `--email --slack --teams --pagerduty --escalate-after 24`.
 - **Hosts:** the scheduler checks the hosts in the database, so changes
   on the Hosts page take effect on the next run. It never runs
   `discover --add`. Run that yourself and review what it adds.
@@ -448,19 +498,18 @@ python -m unittest discover -s tests -v
 ```
 
 The tests start local TLS servers with generated certificates to cover each
-status, and use recorded crt.sh responses for discovery, so they don't need
-internet access.
+status, fake SMTP/IMAP/POP3 servers for STARTTLS, recorded crt.sh responses
+for discovery, and stand-ins for the Slack, Teams and PagerDuty endpoints,
+so they don't need internet access.
 
 ## Roadmap
 
-All four planned phases are done:
+Done so far:
 
 1. CLI checker with email alerts
 2. SQLite history, deduplicated alerts, cron
 3. Web dashboard and Slack alerts
 4. Certificate Transparency discovery, alert acknowledgement and escalation,
    admin/viewer accounts, history cleanup, Docker Compose packaging
-
-Since then, hosts are managed in the database and on the dashboard, and
-mail servers can be checked over STARTTLS. Possible next step: PagerDuty
-or Microsoft Teams alert channels.
+5. Hosts managed in the database and on the dashboard, mail servers
+   checked over STARTTLS, Microsoft Teams and PagerDuty alerts

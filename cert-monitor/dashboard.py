@@ -60,6 +60,8 @@ def _fmt_time(value: str | None) -> str:
 
 
 def _alert_label(key: str) -> str:
+    if key == "RESOLVED":
+        return "Resolved"
     status, _, tier = key.partition(":")
     if status == "EXPIRING_SOON":
         return f"{tier}-day expiry warning" if tier else "Expiry warning"

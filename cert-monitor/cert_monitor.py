@@ -278,6 +278,10 @@ def find_new_alerts(
             # Recovered (e.g. renewed): reset so the next problem alerts again.
             storage.clear_alert_state(conn, target_id)
             continue
+        if "pagerduty" in channels:
+            # Broken again before an earlier incident's resolve went through:
+            # the trigger below reopens that incident, so don't resolve it.
+            storage.cancel_pagerduty_resolve(conn, target_id)
         state = storage.get_alert_state(conn, target_id)
         for channel in channels:
             if state.get(channel) != key:
@@ -320,19 +324,21 @@ def _slack_escape(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def send_slack(title: str, lines: list[str], url_var: str = "SLACK_WEBHOOK_URL") -> bool:
+def _webhook_url(url_var: str, service: str) -> str | None:
     url = os.environ.get(url_var)
     if not url:
-        print(f"[warn] skipping Slack message, missing env var: {url_var}", file=sys.stderr)
-        return False
+        print(f"[warn] skipping {service} message, missing env var: {url_var}", file=sys.stderr)
+        return None
     if not url.startswith("https://"):
-        print(f"[warn] skipping Slack message, {url_var} must be an https:// URL", file=sys.stderr)
-        return False
+        print(f"[warn] skipping {service} message, {url_var} must be an https:// URL", file=sys.stderr)
+        return None
+    return url
 
-    text = f"*cert-monitor: {_slack_escape(title)}*\n" + _slack_escape("\n".join(lines))
+
+def _post_json(url: str, payload: dict, service: str) -> bool:
     request = urllib.request.Request(
         url,
-        data=json.dumps({"text": text}).encode(),
+        data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
@@ -340,10 +346,49 @@ def send_slack(title: str, lines: list[str], url_var: str = "SLACK_WEBHOOK_URL")
         with urllib.request.urlopen(request, timeout=10) as response:
             response.read()
     except (urllib.error.URLError, OSError) as exc:
-        print(f"[error] failed to send Slack message, will retry next run: {exc}", file=sys.stderr)
+        print(f"[error] failed to send {service} message, will retry next run: {exc}", file=sys.stderr)
         return False
+    return True
 
+
+def send_slack(title: str, lines: list[str], url_var: str = "SLACK_WEBHOOK_URL") -> bool:
+    url = _webhook_url(url_var, "Slack")
+    if url is None:
+        return False
+    text = f"*cert-monitor: {_slack_escape(title)}*\n" + _slack_escape("\n".join(lines))
+    if not _post_json(url, {"text": text}, "Slack"):
+        return False
     print("[info] Slack message sent")
+    return True
+
+
+def send_teams(title: str, lines: list[str], url_var: str = "TEAMS_WEBHOOK_URL") -> bool:
+    """Post an Adaptive Card to a Teams channel via a Workflows webhook."""
+    url = _webhook_url(url_var, "Teams")
+    if url is None:
+        return False
+    body = [{"type": "TextBlock", "text": f"cert-monitor: {title}", "weight": "Bolder", "size": "Medium", "wrap": True}]
+    # TextRuns are plain text (unlike TextBlocks, which render Markdown), so
+    # text from remote certificates can't turn into disguised links.
+    for line in "\n".join(lines).split("\n"):
+        body.append({
+            "type": "RichTextBlock",
+            "spacing": "None",
+            "inlines": [{"type": "TextRun", "text": line or " "}],
+        })
+    card = {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "type": "AdaptiveCard",
+        "version": "1.4",
+        "body": body,
+    }
+    payload = {
+        "type": "message",
+        "attachments": [{"contentType": "application/vnd.microsoft.card.adaptive", "content": card}],
+    }
+    if not _post_json(url, payload, "Teams"):
+        return False
+    print("[info] Teams message sent")
     return True
 
 
@@ -408,11 +453,113 @@ def send_alert_email(
     return send_email(title or _default_title(alerts), format_alert_lines(alerts), to_var)
 
 
-NOTIFIERS = {"email": send_alert_email, "slack": send_alert_slack}
+def send_alert_teams(
+    alerts: list[tuple[CertCheckResult, str]],
+    url_var: str = "TEAMS_WEBHOOK_URL",
+    title: str | None = None,
+) -> bool:
+    return send_teams(title or _default_title(alerts), format_alert_lines(alerts), url_var)
+
+
+PAGERDUTY_EVENTS_URL = "https://events.pagerduty.com/v2/enqueue"
+
+
+def _pagerduty_config() -> tuple[str, str] | None:
+    routing_key = os.environ.get("PAGERDUTY_ROUTING_KEY")
+    if not routing_key:
+        print("[warn] skipping PagerDuty, missing env var: PAGERDUTY_ROUTING_KEY", file=sys.stderr)
+        return None
+    url = os.environ.get("PAGERDUTY_EVENTS_URL") or PAGERDUTY_EVENTS_URL
+    if not url.startswith("https://"):
+        print("[warn] skipping PagerDuty, PAGERDUTY_EVENTS_URL must be an https:// URL", file=sys.stderr)
+        return None
+    return routing_key, url
+
+
+def _pagerduty_dedup_key(hostname: str, port: int) -> str:
+    # One incident per host: a later, worse alert updates the same incident.
+    return f"cert-monitor:{targets.format_target(hostname, port)}"
+
+
+def _pagerduty_severity(key: str) -> str:
+    if key == "EXPIRED":
+        return "critical"
+    if key.startswith("EXPIRING_SOON") and not is_urgent(key, 7):
+        return "warning"
+    return "error"
+
+
+def send_alert_pagerduty(alerts: list[tuple[CertCheckResult, str]], title: str | None = None) -> bool:
+    """Trigger (or update) one incident per target. PagerDuty deduplicates by
+    dedup_key, so resending after a partial failure is harmless."""
+    config = _pagerduty_config()
+    if config is None:
+        return False
+    routing_key, url = config
+    delivered = True
+    for r, key in alerts:
+        days = f", {r.days_remaining} days left" if r.days_remaining is not None else ""
+        event = {
+            "routing_key": routing_key,
+            "event_action": "trigger",
+            "dedup_key": _pagerduty_dedup_key(r.hostname, r.port),
+            "payload": {
+                "summary": f"TLS certificate problem on {r.target}: {key}{days}"[:1024],
+                "source": r.target,
+                "severity": _pagerduty_severity(key),
+                "component": "tls-certificate",
+                "class": key.partition(":")[0],
+                "custom_details": {
+                    "status": r.status,
+                    "days_remaining": r.days_remaining,
+                    "not_after": r.not_after,
+                    "issuer": r.issuer,
+                    "subject": r.subject,
+                    "serial_number": r.serial_number,
+                    "error": r.error,
+                },
+            },
+        }
+        delivered &= _post_json(url, event, "PagerDuty")
+    if delivered:
+        print(f"[info] PagerDuty incident(s) triggered for {len(alerts)} target(s)")
+    return delivered
+
+
+def resolve_pagerduty_incidents(conn: sqlite3.Connection) -> None:
+    """Resolve the incidents of targets that recovered or were removed."""
+    pending = storage.pending_pagerduty_resolves(conn)
+    if not pending:
+        return
+    config = _pagerduty_config()
+    if config is None:
+        return
+    routing_key, url = config
+    for row in pending:
+        event = {
+            "routing_key": routing_key,
+            "event_action": "resolve",
+            "dedup_key": _pagerduty_dedup_key(row["hostname"], row["port"]),
+        }
+        if _post_json(url, event, "PagerDuty"):
+            storage.finish_pagerduty_resolve(conn, row["target_id"], _utc_now_iso())
+            conn.commit()
+            label = targets.format_target(row["hostname"], row["port"], row["protocol"])
+            print(f"[info] PagerDuty incident resolved for {label}")
+
+
+NOTIFIERS = {
+    "email": send_alert_email,
+    "slack": send_alert_slack,
+    "teams": send_alert_teams,
+    "pagerduty": send_alert_pagerduty,
+}
 ESCALATION_SUFFIX = ":escalation"
+# PagerDuty isn't here: it escalates with its own escalation policies.
 ESCALATION_NOTIFIERS = {
     "email": functools.partial(send_alert_email, to_var="ESCALATION_EMAILS"),
     "slack": functools.partial(send_alert_slack, url_var="ESCALATION_SLACK_WEBHOOK_URL"),
+    "teams": functools.partial(send_alert_teams, url_var="ESCALATION_TEAMS_WEBHOOK_URL"),
 }
 
 
@@ -468,6 +615,8 @@ def cmd_check(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
     else:
         to_check = [(t["hostname"], t["port"], t["protocol"]) for t in storage.active_targets(conn)]
         if not to_check:
+            if args.pagerduty:
+                resolve_pagerduty_incidents(conn)
             print(
                 "[error] no hosts to check: add some with 'targets add HOST', "
                 "or pass hosts / --targets-file",
@@ -502,9 +651,13 @@ def cmd_check(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
                 storage.record_alert(conn, target_id, key, channel, sent_at)
             conn.commit()
 
+    if args.pagerduty:
+        resolve_pagerduty_incidents(conn)
+
     if args.escalate_after is not None:
         escalations = find_escalations(
-            conn, checked, args.alert_tiers, channels, args.escalate_after, args.escalate_within_days
+            conn, checked, args.alert_tiers, [c for c in channels if c in ESCALATION_NOTIFIERS],
+            args.escalate_after, args.escalate_within_days,
         )
         for channel, alerts in escalations.items():
             if not alerts:
@@ -546,7 +699,7 @@ def cmd_history(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
     return 0
 
 
-CT_NOTIFIERS = {"email": send_email, "slack": send_slack}
+CT_NOTIFIERS = {"email": send_email, "slack": send_slack, "teams": send_teams}
 
 
 def format_ct_lines(rows) -> list[str]:
@@ -887,6 +1040,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     check.add_argument("--email", action="store_true", help="email admins about new alerts")
     check.add_argument("--slack", action="store_true", help="post new alerts to a Slack webhook")
+    check.add_argument("--teams", action="store_true", help="post new alerts to a Microsoft Teams webhook")
+    check.add_argument(
+        "--pagerduty", action="store_true",
+        help="open a PagerDuty incident per problem host, resolved automatically when it's fixed",
+    )
     check.add_argument(
         "--escalate-after", type=float, metavar="HOURS",
         help="escalate urgent alerts nobody has acknowledged after this many hours (off by default)",
@@ -922,6 +1080,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     discover.add_argument("--email", action="store_true", help="email a report of newly issued certificates")
     discover.add_argument("--slack", action="store_true", help="post newly issued certificates to Slack")
+    discover.add_argument("--teams", action="store_true", help="post newly issued certificates to Teams")
     discover.set_defaults(func=cmd_discover, parser=discover)
 
     hosts = subparsers.add_parser("targets", help="manage the hosts that 'check' monitors")
