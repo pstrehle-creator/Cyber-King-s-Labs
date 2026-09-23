@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+
+{% block head %}<meta http-equiv="refresh" content="300">{% endblock %}
+
+{% block content %}
+<h1>Certificate status</h1>
+
+<section class="summary" aria-label="Summary">
+  {% for status, count in counts.items() %}
+  <div class="card{% if count %} status-{{ status|lower }}{% endif %}">
+    <span class="count">{{ count }}</span>
+    <span class="label">{{ status|status_label }}</span>
+  </div>
+  {% endfor %}
+</section>
+
+{% if stale %}
+<p class="notice">
+  {{ stale }} target{{ 's' if stale != 1 }} not checked in over {{ stale_hours|int }} hours.
+  Make sure the scheduled <code>check</code> job is still running.
+</p>
+{% endif %}
+
+{% if not rows %}
+<p class="empty">No checks recorded yet. Run <code>python cert_monitor.py check ...</code> first.</p>
+{% else %}
+<div class="table-wrap">
+  <table>
+    <thead>
+      <tr>
+        <th>Target</th>
+        <th>Status</th>
+        <th class="num">Days left</th>
+        <th class="hide-sm">Expires</th>
+        <th class="hide-sm">Issuer / error</th>
+        <th class="hide-sm">Last checked</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in rows %}
+      <tr>
+        <td class="target"><a href="{{ url_for('target', hostname=r.hostname, port=r.port) }}">{{ r.hostname }}:{{ r.port }}</a></td>
+        <td>
+          <span class="badge status-{{ r.status|lower }}">{{ r.status|status_label }}</span>
+          {% if r.stale %}<span class="badge stale show-sm">stale</span>{% endif %}
+        </td>
+        <td class="num">{{ r.days_remaining if r.days_remaining is not none else '—' }}</td>
+        <td class="nowrap hide-sm">{{ r.not_after|fmt_time }}</td>
+        <td class="detail hide-sm">{{ r.error if r.status != 'OK' and r.error else (r.issuer or '—') }}</td>
+        <td class="nowrap hide-sm">
+          {{ r.checked_at|fmt_time }}
+          {% if r.stale %}<span class="badge stale">stale</span>{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+{% endblock %}

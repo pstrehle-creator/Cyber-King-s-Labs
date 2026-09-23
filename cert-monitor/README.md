@@ -1,11 +1,12 @@
 # cert-monitor
 
-A CLI tool that checks TLS certificate expiry for a list of hosts, keeps a
-history of every check in SQLite, and emails admins before certificates
-lapse. Built to run from cron.
+A tool that checks TLS certificate expiry for a list of hosts, keeps a
+history of every check in SQLite, alerts admins by email and Slack before
+certificates lapse, and shows everything on a web dashboard. The checks are
+built to run from cron.
 
-Current state: **Phase 2** (CLI + SQLite history + deduplicated email alerts).
-See the [roadmap](#roadmap) for what comes next.
+Current state: **Phase 3** (CLI + SQLite history + email/Slack alerts + web
+dashboard). See the [roadmap](#roadmap) for what comes next.
 
 ## Install
 
@@ -64,6 +65,53 @@ python cert_monitor.py history example.com --limit 20
 `check` returns `0` if everything is OK, `1` if something is expiring soon,
 and `2` if something is expired, unreachable, or has an invalid chain.
 
+## Web dashboard
+
+```bash
+python cert_monitor.py serve
+```
+
+Then open <http://127.0.0.1:8080>. The dashboard is read-only. It shows the
+data that `check` runs record, and it doesn't run checks itself.
+
+- **Status page:** counts for each status, and every target's latest
+  result with problems listed first. It reloads every 5 minutes.
+- **Target page:** click a target to see its certificate details (subject,
+  issuer, SANs, serial, validity dates, chain trust), its last 50 checks, and
+  the alerts sent for it. When the serial number changes in the history, the
+  certificate was renewed.
+- **Stale check warning:** if a target's latest check is older than
+  `--stale-hours` (default 24), it gets a "stale" badge. This catches the
+  case where the cron job has stopped and the dashboard is showing old
+  results.
+- **JSON API:** `GET /api/status` returns every target's latest result, and
+  `GET /api/targets/<host>/<port>` returns one target's history.
+
+### Access and security
+
+By default the dashboard only accepts connections from this machine
+(`127.0.0.1`). To reach it from other machines, set a password and choose
+an address to listen on:
+
+```bash
+export DASHBOARD_USER=admin            # optional, defaults to "admin"
+export DASHBOARD_PASSWORD='a-long-random-password'
+python cert_monitor.py serve --host 0.0.0.0 --port 8080
+```
+
+`serve` won't start on a non-local address unless `DASHBOARD_PASSWORD` is
+set. When it's set, every page and API call asks for that username and
+password (HTTP basic auth).
+
+Basic auth sends the password with every request. `serve` uses Flask's
+built-in server, which only speaks plain HTTP, so anyone watching the
+network can read the password. If you open the dashboard to other machines,
+put a reverse proxy that handles HTTPS in front of it (nginx, Caddy, etc.).
+
+Certificate fields come from remote servers, so a hostile server could put
+HTML or script in them. The dashboard HTML-escapes every value it displays,
+and it sends a strict Content-Security-Policy header.
+
 ## Email alerts
 
 With `--email`, admins get **one email each time a target moves into a new
@@ -97,9 +145,28 @@ Set these environment variables before running with `--email`:
 If `--email` is passed but a required variable is missing, the run prints a
 warning and skips sending. The checks themselves still run and are recorded.
 
+## Slack alerts
+
+With `--slack`, the same alerts are posted to a Slack channel through an
+[incoming webhook](https://api.slack.com/messaging/webhooks):
+
+```bash
+export SLACK_WEBHOOK_URL='https://hooks.slack.com/services/...'
+python cert_monitor.py check --targets-file targets.txt --slack
+```
+
+Slack follows the same once-per-state-change rules as email. Each channel
+keeps track of what it has already sent, so you can use `--email --slack`
+together. If one channel fails, only that channel retries on the next run.
+
+Treat the webhook URL like a password, since anyone who has it can post to
+your channel. Text taken from certificates is escaped before posting, so a
+hostile server can't put `@channel` pings or disguised links into your
+alerts.
+
 ## Running on a schedule (cron)
 
-Put the SMTP settings in a file that only you can read, so they're not in
+Put the SMTP and Slack settings in a file that only you can read, so they're not in
 the crontab itself:
 
 ```bash
@@ -109,6 +176,7 @@ export SMTP_USER=alerts@example.com
 export SMTP_PASSWORD=change-me
 export ALERT_FROM_EMAIL=alerts@example.com
 export ALERT_TO_EMAILS=admin1@example.com,admin2@example.com
+export SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...
 EOF
 chmod 600 ~/.cert-monitor.env
 ```
@@ -116,8 +184,8 @@ chmod 600 ~/.cert-monitor.env
 Then add a crontab entry with `crontab -e`:
 
 ```cron
-# every 6 hours; dedup means admins are only emailed when something changes
-0 */6 * * * . $HOME/.cert-monitor.env && cd /path/to/cert-monitor && ./venv/bin/python cert_monitor.py check --targets-file targets.txt --email >> cert_monitor.log 2>&1
+# every 6 hours; alerts are only sent when something changes
+0 */6 * * * . $HOME/.cert-monitor.env && cd /path/to/cert-monitor && ./venv/bin/python cert_monitor.py check --targets-file targets.txt --email --slack >> cert_monitor.log 2>&1
 ```
 
 Frequent runs are safe because alerts are deduplicated. More runs just mean
@@ -136,6 +204,6 @@ status, so they don't need internet access.
 
 - ~~**Phase 1** — CLI checker with email alerts.~~
 - ~~**Phase 2** — SQLite history, deduplicated alerts, cron.~~
-- **Phase 3** — FastAPI/Flask dashboard + Slack webhook alerts.
+- ~~**Phase 3** — Web dashboard + Slack webhook alerts.~~
 - **Phase 4** — Certificate Transparency log discovery, escalation chains,
   RBAC, history retention/pruning, Docker Compose packaging.

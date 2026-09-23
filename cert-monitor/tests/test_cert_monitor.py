@@ -1,8 +1,11 @@
+import json
 import socket
+import sqlite3
 import ssl
 import tempfile
 import threading
 import unittest
+import urllib.error
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
@@ -206,9 +209,12 @@ class AlertDedupeTests(unittest.TestCase):
     def tearDown(self):
         self.conn.close()
 
-    def _run(self, status, days=None):
+    def _find(self, status, days=None, channels=("email",)):
         result = CertCheckResult(hostname="example.com", port=443, status=status, days_remaining=days)
-        alerts = cert_monitor.find_new_alerts(self.conn, [(self.target_id, result)], TIERS)
+        return cert_monitor.find_new_alerts(self.conn, [(self.target_id, result)], TIERS, list(channels))
+
+    def _run(self, status, days=None):
+        alerts = self._find(status, days)["email"]
         for target_id, _, key in alerts:
             storage.record_alert(self.conn, target_id, key, "email", "2026-01-01T00:00:00+00:00")
         return [key for _, _, key in alerts]
@@ -227,11 +233,85 @@ class AlertDedupeTests(unittest.TestCase):
         self.assertEqual(self._run("UNREACHABLE"), ["UNREACHABLE"])
 
     def test_unsent_alert_is_retried(self):
-        result = CertCheckResult(hostname="example.com", port=443, status="EXPIRED", days_remaining=-1)
-        first = cert_monitor.find_new_alerts(self.conn, [(self.target_id, result)], TIERS)
-        second = cert_monitor.find_new_alerts(self.conn, [(self.target_id, result)], TIERS)
-        self.assertEqual(len(first), 1)
-        self.assertEqual(len(second), 1)
+        self.assertEqual(len(self._find("EXPIRED", -1)["email"]), 1)
+        self.assertEqual(len(self._find("EXPIRED", -1)["email"]), 1)
+
+    def test_channels_are_tracked_independently(self):
+        both = ("email", "slack")
+        first = self._find("EXPIRED", -1, both)
+        self.assertEqual((len(first["email"]), len(first["slack"])), (1, 1))
+        # Email delivered, Slack failed: only Slack should be retried.
+        storage.record_alert(self.conn, self.target_id, "EXPIRED", "email", "2026-01-01T00:00:00+00:00")
+        second = self._find("EXPIRED", -1, both)
+        self.assertEqual((len(second["email"]), len(second["slack"])), (0, 1))
+
+    def test_recovery_clears_state_even_with_no_channels_enabled(self):
+        self._run("EXPIRED", -1)
+        self._find("OK", 90, channels=())
+        self.assertEqual(storage.get_alert_state(self.conn, self.target_id), {})
+
+
+class Phase2MigrationTests(unittest.TestCase):
+    def test_email_alert_state_is_carried_over(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "phase2.db")
+            legacy = sqlite3.connect(db_path)
+            legacy.execute(
+                "CREATE TABLE targets (id INTEGER PRIMARY KEY, hostname TEXT NOT NULL, port INTEGER NOT NULL, "
+                "created_at TEXT NOT NULL DEFAULT '', last_alert_key TEXT, UNIQUE (hostname, port))"
+            )
+            legacy.execute(
+                "INSERT INTO targets (hostname, port, last_alert_key) VALUES ('example.com', 443, 'EXPIRING_SOON:14')"
+            )
+            legacy.commit()
+            legacy.close()
+
+            conn = storage.connect(db_path)
+            target_id = storage.upsert_target(conn, "example.com", 443)
+            self.assertEqual(storage.get_alert_state(conn, target_id), {"email": "EXPIRING_SOON:14"})
+            # A later recovery must not be undone by re-running the migration.
+            storage.clear_alert_state(conn, target_id)
+            conn.commit()
+            conn.close()
+            conn = storage.connect(db_path)
+            self.assertEqual(storage.get_alert_state(conn, target_id), {})
+            conn.close()
+
+
+class SlackTests(unittest.TestCase):
+    ALERT = (
+        CertCheckResult(
+            hostname="evil.example", port=443, status="INVALID_CHAIN",
+            error="bad cert <!channel> <https://phish.example|click here> & more",
+        ),
+        "INVALID_CHAIN",
+    )
+
+    def test_posts_escaped_text_to_webhook(self):
+        with mock.patch.dict("os.environ", {"SLACK_WEBHOOK_URL": "https://hooks.slack.com/services/T/B/X"}), \
+                mock.patch("cert_monitor.urllib.request.urlopen") as urlopen, mock.patch("sys.stdout"):
+            self.assertTrue(cert_monitor.send_alert_slack([self.ALERT]))
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, "https://hooks.slack.com/services/T/B/X")
+        text = json.loads(request.data)["text"]
+        self.assertIn("evil.example:443: INVALID_CHAIN", text)
+        self.assertNotIn("<!channel>", text)
+        self.assertNotIn("<https://", text)
+        self.assertIn("&lt;!channel&gt;", text)
+        self.assertIn("&amp; more", text)
+
+    def test_failed_post_returns_false(self):
+        with mock.patch.dict("os.environ", {"SLACK_WEBHOOK_URL": "https://hooks.slack.com/services/T/B/X"}), \
+                mock.patch("cert_monitor.urllib.request.urlopen", side_effect=urllib.error.URLError("down")), \
+                mock.patch("sys.stderr"):
+            self.assertFalse(cert_monitor.send_alert_slack([self.ALERT]))
+
+    def test_rejects_missing_or_non_https_url(self):
+        for env in ({}, {"SLACK_WEBHOOK_URL": "http://hooks.slack.com/x"}):
+            with mock.patch.dict("os.environ", env, clear=True), \
+                    mock.patch("cert_monitor.urllib.request.urlopen") as urlopen, mock.patch("sys.stderr"):
+                self.assertFalse(cert_monitor.send_alert_slack([self.ALERT]))
+            urlopen.assert_not_called()
 
 
 if __name__ == "__main__":

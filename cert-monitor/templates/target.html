@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+
+{% block title %}{{ target.hostname }}:{{ target.port }}{% endblock %}
+
+{% block content %}
+<p class="back"><a href="{{ url_for('index') }}">← All targets</a></p>
+<h1>{{ target.hostname }}:{{ target.port }}</h1>
+
+{% if latest %}
+<section class="panel">
+  <h2>
+    Latest check
+    <span class="badge status-{{ latest.status|lower }}">{{ latest.status|status_label }}</span>
+    {% if latest.stale %}<span class="badge stale">stale</span>{% endif %}
+  </h2>
+  <dl class="facts">
+    <dt>Checked</dt><dd>{{ latest.checked_at|fmt_time }}</dd>
+    {% if latest.serial_number %}
+    <dt>Subject</dt><dd>{{ latest.subject or '—' }}</dd>
+    <dt>Issuer</dt><dd>{{ latest.issuer or '—' }}</dd>
+    <dt>SANs</dt><dd>{{ latest.san|join(', ') or '—' }}</dd>
+    <dt>Valid from</dt><dd>{{ latest.not_before|fmt_time }}</dd>
+    <dt>Expires</dt><dd>{{ latest.not_after|fmt_time }} ({{ latest.days_remaining }} days)</dd>
+    <dt>Serial</dt><dd><code>{{ latest.serial_number }}</code></dd>
+    <dt>Chain</dt><dd>{{ 'Trusted' if latest.chain_valid else 'Not trusted' }}</dd>
+    {% else %}
+    <dt>Certificate</dt><dd>None retrieved on this check</dd>
+    {% endif %}
+    {% if latest.error %}<dt>Error</dt><dd class="detail">{{ latest.error }}</dd>{% endif %}
+  </dl>
+</section>
+{% endif %}
+
+<section>
+  <h2>Check history</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Checked</th>
+          <th>Status</th>
+          <th class="num">Days left</th>
+          <th class="hide-sm">Expires</th>
+          <th class="hide-sm">Serial</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in history %}
+        <tr>
+          <td class="nowrap">{{ r.checked_at|fmt_time }}</td>
+          <td><span class="badge status-{{ r.status|lower }}">{{ r.status|status_label }}</span></td>
+          <td class="num">{{ r.days_remaining if r.days_remaining is not none else '—' }}</td>
+          <td class="nowrap hide-sm">{{ r.not_after|fmt_time }}</td>
+          <td class="hide-sm"><code>{{ r.serial_number or '—' }}</code></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section>
+  <h2>Alerts sent</h2>
+  {% if alerts %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Sent</th><th>Alert</th><th>Channel</th></tr></thead>
+      <tbody>
+        {% for a in alerts %}
+        <tr>
+          <td class="nowrap">{{ a.sent_at|fmt_time }}</td>
+          <td>{{ a.alert_key }}</td>
+          <td>{{ a.channel }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">No alerts sent for this target.</p>
+  {% endif %}
+</section>
+{% endblock %}

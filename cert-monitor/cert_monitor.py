@@ -3,19 +3,22 @@
 cert_monitor.py - CLI for the TLS/SSL certificate monitoring app.
 
 Checks a list of host[:port] targets, records every result in SQLite, and
-(optionally) emails admins when a target newly needs attention: it crosses
-an expiry tier, expires, becomes unreachable, or fails chain validation.
+(optionally) alerts admins by email and/or Slack when a target newly needs
+attention: it crosses an expiry tier, expires, becomes unreachable, or fails
+chain validation. Also serves a read-only web dashboard over the history.
 
 Usage:
     python cert_monitor.py check example.com github.com:443
-    python cert_monitor.py check --targets-file targets.txt --email
+    python cert_monitor.py check --targets-file targets.txt --email --slack
     python cert_monitor.py history
     python cert_monitor.py history example.com --limit 10
+    python cert_monitor.py serve
 """
 
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import smtplib
@@ -23,6 +26,8 @@ import socket
 import sqlite3
 import ssl
 import sys
+import urllib.error
+import urllib.request
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from email.message import EmailMessage
@@ -30,6 +35,7 @@ from pathlib import Path
 
 from cryptography import x509
 
+import dashboard
 import storage
 
 DEFAULT_PORT = 443
@@ -182,16 +188,24 @@ def alert_key(result: CertCheckResult, tiers: list[int]) -> str | None:
 
 
 def find_new_alerts(
-    conn: sqlite3.Connection, checked: list[tuple[int, CertCheckResult]], tiers: list[int]
-) -> list[tuple[int, CertCheckResult, str]]:
-    new_alerts = []
+    conn: sqlite3.Connection,
+    checked: list[tuple[int, CertCheckResult]],
+    tiers: list[int],
+    channels: list[str],
+) -> dict[str, list[tuple[int, CertCheckResult, str]]]:
+    """Per channel, the alerts not yet delivered on that channel. Channels are
+    tracked separately so a failed send is retried only where it failed."""
+    new_alerts = {channel: [] for channel in channels}
     for target_id, result in checked:
         key = alert_key(result, tiers)
         if key is None:
             # Recovered (e.g. renewed): reset so the next problem alerts again.
-            storage.clear_last_alert_key(conn, target_id)
-        elif key != storage.get_last_alert_key(conn, target_id):
-            new_alerts.append((target_id, result, key))
+            storage.clear_alert_state(conn, target_id)
+            continue
+        state = storage.get_alert_state(conn, target_id)
+        for channel in channels:
+            if state.get(channel) != key:
+                new_alerts[channel].append((target_id, result, key))
     return new_alerts
 
 
@@ -210,6 +224,53 @@ def print_table(rows: list[dict], show_time: bool = False) -> None:
             f"{time_val}{target:<{width}} {r['status']:<15} {days:>6}  "
             f"{r['not_after'] or '-':<26} {detail}"
         )
+
+
+def format_alert_lines(alerts: list[tuple[CertCheckResult, str]]) -> list[str]:
+    lines = []
+    for r, key in alerts:
+        line = f"- {r.target}: {key}"
+        if r.days_remaining is not None:
+            line += f" ({r.days_remaining} days remaining, expires {r.not_after})"
+        if r.error:
+            line += f"\n    {r.error}"
+        lines.append(line)
+    return lines
+
+
+def _slack_escape(text: str) -> str:
+    # Cert fields and errors come from remote servers; unescaped, a crafted
+    # value like "<!channel>" would ping the whole channel or inject a link.
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def send_alert_slack(alerts: list[tuple[CertCheckResult, str]]) -> bool:
+    url = os.environ.get("SLACK_WEBHOOK_URL")
+    if not url:
+        print("[warn] skipping Slack alert, missing env var: SLACK_WEBHOOK_URL", file=sys.stderr)
+        return False
+    if not url.startswith("https://"):
+        print("[warn] skipping Slack alert, SLACK_WEBHOOK_URL must be an https:// URL", file=sys.stderr)
+        return False
+
+    text = f"*cert-monitor: {len(alerts)} certificate(s) need attention*\n" + _slack_escape(
+        "\n".join(format_alert_lines(alerts))
+    )
+    request = urllib.request.Request(
+        url,
+        data=json.dumps({"text": text}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            response.read()
+    except (urllib.error.URLError, OSError) as exc:
+        print(f"[error] failed to send Slack alert, will retry next run: {exc}", file=sys.stderr)
+        return False
+
+    print("[info] Slack alert sent")
+    return True
 
 
 def send_alert_email(alerts: list[tuple[CertCheckResult, str]]) -> bool:
@@ -233,15 +294,7 @@ def send_alert_email(alerts: list[tuple[CertCheckResult, str]]) -> bool:
         print(f"[warn] skipping email alert, missing env vars: {', '.join(missing)}", file=sys.stderr)
         return False
 
-    lines = []
-    for r, key in alerts:
-        line = f"- {r.target}: {key}"
-        if r.days_remaining is not None:
-            line += f" ({r.days_remaining} days remaining, expires {r.not_after})"
-        if r.error:
-            line += f"\n    {r.error}"
-        lines.append(line)
-    body = "The following certificates need attention:\n\n" + "\n".join(lines)
+    body = "The following certificates need attention:\n\n" + "\n".join(format_alert_lines(alerts))
 
     msg = EmailMessage()
     msg["Subject"] = f"[cert-monitor] {len(alerts)} certificate(s) need attention"
@@ -261,6 +314,9 @@ def send_alert_email(alerts: list[tuple[CertCheckResult, str]]) -> bool:
 
     print(f"[info] alert email sent to {', '.join(to_addrs)}")
     return True
+
+
+NOTIFIERS = {"email": send_alert_email, "slack": send_alert_slack}
 
 
 def cmd_check(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
@@ -288,13 +344,14 @@ def cmd_check(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
         args.json_out.write_text(json.dumps([asdict(r) for r in results], indent=2))
         print(f"[info] wrote results to {args.json_out}")
 
-    new_alerts = find_new_alerts(conn, checked, args.alert_tiers)
+    channels = [channel for channel in NOTIFIERS if getattr(args, channel)]
+    new_alerts = find_new_alerts(conn, checked, args.alert_tiers, channels)
     conn.commit()
-    if new_alerts and args.email:
-        if send_alert_email([(r, key) for _, r, key in new_alerts]):
+    for channel, alerts in new_alerts.items():
+        if alerts and NOTIFIERS[channel]([(r, key) for _, r, key in alerts]):
             sent_at = _utc_now_iso()
-            for target_id, _, key in new_alerts:
-                storage.record_alert(conn, target_id, key, "email", sent_at)
+            for target_id, _, key in alerts:
+                storage.record_alert(conn, target_id, key, channel, sent_at)
             conn.commit()
 
     if any(r.status in FAILURE_STATUSES for r in results):
@@ -318,6 +375,34 @@ def cmd_history(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
             print("no checks recorded yet; run the 'check' command first")
             return 0
         print_table([dict(r) for r in rows], show_time=True)
+    return 0
+
+
+def _is_loopback(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def cmd_serve(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
+    password = os.environ.get("DASHBOARD_PASSWORD") or None
+    if password is None and not _is_loopback(args.host):
+        print(
+            f"[error] refusing to serve on {args.host} without a password; "
+            "set DASHBOARD_PASSWORD or use --host 127.0.0.1",
+            file=sys.stderr,
+        )
+        return 2
+    app = dashboard.create_app(
+        args.db,
+        stale_hours=args.stale_hours,
+        username=os.environ.get("DASHBOARD_USER", "admin"),
+        password=password,
+    )
+    app.run(host=args.host, port=args.port)
     return 0
 
 
@@ -352,6 +437,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="connection timeout in seconds (default: 5)",
     )
     check.add_argument("--email", action="store_true", help="email admins about new alerts")
+    check.add_argument("--slack", action="store_true", help="post new alerts to a Slack webhook")
     check.add_argument("--json-out", type=Path, help="write full results as JSON to this path")
     check.set_defaults(func=cmd_check, parser=check)
 
@@ -361,6 +447,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     history.add_argument("target", nargs="?", help="host or host:port to show history for")
     history.add_argument("--limit", type=int, default=20, help="max rows for one target (default: 20)")
     history.set_defaults(func=cmd_history)
+
+    serve = subparsers.add_parser("serve", parents=[common], help="run the read-only web dashboard")
+    serve.add_argument("--host", default="127.0.0.1", help="address to listen on (default: 127.0.0.1)")
+    serve.add_argument("--port", type=int, default=8080, help="port to listen on (default: 8080)")
+    serve.add_argument(
+        "--stale-hours", type=float, default=24,
+        help="flag targets whose latest check is older than this (default: 24)",
+    )
+    serve.set_defaults(func=cmd_serve)
 
     return parser
 
