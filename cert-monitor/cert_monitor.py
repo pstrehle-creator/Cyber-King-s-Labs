@@ -5,22 +5,25 @@ cert_monitor.py - CLI for the TLS/SSL certificate monitoring app.
 Checks a list of host[:port] targets, records every result in SQLite, and
 (optionally) alerts admins by email and/or Slack when a target newly needs
 attention: it crosses an expiry tier, expires, becomes unreachable, or fails
-chain validation. Also serves a read-only web dashboard over the history.
+chain validation. Also serves a web dashboard over the history.
 
 Usage:
     python cert_monitor.py check example.com github.com:443
     python cert_monitor.py check --targets-file targets.txt --email --slack
     python cert_monitor.py history
     python cert_monitor.py history example.com --limit 10
+    python cert_monitor.py prune --keep-days 90
+    python cert_monitor.py user add alice --role admin
     python cert_monitor.py serve
 """
 
 from __future__ import annotations
 
 import argparse
-import ipaddress
+import getpass
 import json
 import os
+import re
 import smtplib
 import socket
 import sqlite3
@@ -33,6 +36,7 @@ from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
 
+import waitress
 from cryptography import x509
 
 import dashboard
@@ -386,31 +390,79 @@ def cmd_prune(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
     return 0
 
 
-def _is_loopback(host: str) -> bool:
-    if host == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
-
-
 def cmd_serve(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
-    password = os.environ.get("DASHBOARD_PASSWORD") or None
-    if password is None and not _is_loopback(args.host):
+    if os.environ.get("DASHBOARD_PASSWORD"):
         print(
-            f"[error] refusing to serve on {args.host} without a password; "
-            "set DASHBOARD_PASSWORD or use --host 127.0.0.1",
+            "[warn] DASHBOARD_PASSWORD is no longer used; dashboard logins are managed with 'user add'",
+            file=sys.stderr,
+        )
+    if storage.count_users(conn) == 0:
+        print(
+            "[error] no dashboard accounts exist yet; create one first:\n"
+            f"  python cert_monitor.py user add YOUR_NAME --role admin --db {args.db}",
             file=sys.stderr,
         )
         return 2
     app = dashboard.create_app(
         args.db,
         stale_hours=args.stale_hours,
-        username=os.environ.get("DASHBOARD_USER", "admin"),
-        password=password,
+        secret_key=os.environ.get("DASHBOARD_SECRET_KEY") or None,
+        secure_cookies=os.environ.get("DASHBOARD_SECURE_COOKIES") == "1",
     )
-    app.run(host=args.host, port=args.port)
+    print(f"[info] dashboard listening on http://{args.host}:{args.port}")
+    waitress.serve(app, host=args.host, port=args.port)
+    return 0
+
+
+MIN_PASSWORD_LENGTH = 12
+USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9._@-]{1,64}$")
+
+
+def _read_new_password(from_stdin: bool) -> str | None:
+    if from_stdin:
+        password = sys.stdin.readline().rstrip("\r\n")
+    else:
+        password = getpass.getpass("Password: ")
+        if getpass.getpass("Repeat password: ") != password:
+            print("[error] passwords don't match", file=sys.stderr)
+            return None
+    if len(password) < MIN_PASSWORD_LENGTH:
+        print(f"[error] password must be at least {MIN_PASSWORD_LENGTH} characters", file=sys.stderr)
+        return None
+    return password
+
+
+def cmd_user_add(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
+    if not USERNAME_PATTERN.match(args.username):
+        print("[error] usernames may use letters, digits, and . _ @ - (max 64 characters)", file=sys.stderr)
+        return 2
+    password = _read_new_password(args.password_stdin)
+    if password is None:
+        return 2
+    created = storage.save_user(conn, args.username, dashboard.hash_password(password), args.role)
+    conn.commit()
+    print(f"[info] {'created' if created else 'updated'} {args.role} account '{args.username}'")
+    return 0
+
+
+def cmd_user_remove(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
+    if not storage.remove_user(conn, args.username):
+        print(f"[error] no account named '{args.username}'", file=sys.stderr)
+        return 2
+    conn.commit()
+    print(f"[info] removed account '{args.username}'")
+    return 0
+
+
+def cmd_user_list(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
+    users = storage.list_users(conn)
+    if not users:
+        print("no accounts yet; create one with: python cert_monitor.py user add NAME --role admin")
+        return 0
+    width = max(len("USERNAME"), *(len(u["username"]) for u in users))
+    print(f"{'USERNAME':<{width}}  {'ROLE':<7} CREATED")
+    for u in users:
+        print(f"{u['username']:<{width}}  {u['role']:<7} {u['created_at']}")
     return 0
 
 
@@ -475,7 +527,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     prune.set_defaults(func=cmd_prune)
 
-    serve = subparsers.add_parser("serve", parents=[common], help="run the read-only web dashboard")
+    user = subparsers.add_parser("user", help="manage dashboard accounts")
+    user_commands = user.add_subparsers(dest="user_command", required=True)
+    user_add = user_commands.add_parser(
+        "add", parents=[common], help="create an account, or reset its password and role"
+    )
+    user_add.add_argument("username")
+    user_add.add_argument(
+        "--role", choices=storage.ROLES, required=True,
+        help="admin: can view and acknowledge alerts; viewer: read-only",
+    )
+    user_add.add_argument(
+        "--password-stdin", action="store_true",
+        help="read the password from the first line of stdin instead of prompting",
+    )
+    user_add.set_defaults(func=cmd_user_add)
+    user_remove = user_commands.add_parser("remove", parents=[common], help="delete an account")
+    user_remove.add_argument("username")
+    user_remove.set_defaults(func=cmd_user_remove)
+    user_list = user_commands.add_parser("list", parents=[common], help="list accounts")
+    user_list.set_defaults(func=cmd_user_list)
+
+    serve = subparsers.add_parser("serve", parents=[common], help="run the web dashboard")
     serve.add_argument("--host", default="127.0.0.1", help="address to listen on (default: 127.0.0.1)")
     serve.add_argument("--port", type=int, default=8080, help="port to listen on (default: 8080)")
     serve.add_argument(

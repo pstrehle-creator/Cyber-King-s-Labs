@@ -45,7 +45,17 @@ CREATE TABLE IF NOT EXISTS alert_state (
     alert_key TEXT NOT NULL,
     PRIMARY KEY (target_id, channel)
 );
+
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY,
+    username TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('admin', 'viewer')),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
 """
+
+ROLES = ("admin", "viewer")
 
 
 def connect(path: str) -> sqlite3.Connection:
@@ -181,6 +191,36 @@ def prune_checks(conn: sqlite3.Connection, older_than: str) -> int:
         (older_than,),
     )
     return cursor.rowcount
+
+
+def save_user(conn: sqlite3.Connection, username: str, password_hash: str, role: str) -> bool:
+    """Create the user, or reset the password and role if it exists. Returns
+    True if the user was created."""
+    created = get_user(conn, username) is None
+    conn.execute(
+        """
+        INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)
+        ON CONFLICT (username) DO UPDATE SET password_hash = excluded.password_hash, role = excluded.role
+        """,
+        (username, password_hash, role),
+    )
+    return created
+
+
+def get_user(conn: sqlite3.Connection, username: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+
+
+def list_users(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute("SELECT username, role, created_at FROM users ORDER BY username").fetchall()
+
+
+def remove_user(conn: sqlite3.Connection, username: str) -> bool:
+    return conn.execute("DELETE FROM users WHERE username = ?", (username,)).rowcount > 0
+
+
+def count_users(conn: sqlite3.Connection) -> int:
+    return conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
 
 
 def target_alerts(conn: sqlite3.Connection, target_id: int, limit: int) -> list[sqlite3.Row]:

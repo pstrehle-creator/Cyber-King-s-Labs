@@ -79,12 +79,15 @@ and `2` if something is expired, unreachable, or has an invalid chain.
 
 ## Web dashboard
 
+The dashboard requires an account, so create one first:
+
 ```bash
+python cert_monitor.py user add alice --role admin
 python cert_monitor.py serve
 ```
 
-Then open <http://127.0.0.1:8080>. The dashboard is read-only. It shows the
-data that `check` runs record, and it doesn't run checks itself.
+Then open <http://127.0.0.1:8080> and sign in. The dashboard shows the data
+that `check` runs record. It doesn't run checks itself.
 
 - **Status page:** counts for each status, and every target's latest
   result with problems listed first. It reloads every 5 minutes.
@@ -97,32 +100,58 @@ data that `check` runs record, and it doesn't run checks itself.
   case where the cron job has stopped and the dashboard is showing old
   results.
 - **JSON API:** `GET /api/status` returns every target's latest result, and
-  `GET /api/targets/<host>/<port>` returns one target's history.
+  `GET /api/targets/<host>/<port>` returns one target's history. Scripts can
+  sign in with HTTP basic auth, for example
+  `curl -u alice https://certs.example.com/api/status`.
+
+### Accounts and roles
+
+There are two roles:
+
+| Role     | Can do                                                   |
+|----------|----------------------------------------------------------|
+| `viewer` | See everything on the dashboard and use the JSON API     |
+| `admin`  | Everything a viewer can, plus admin-only actions         |
+
+Manage accounts from the command line on the server:
+
+```bash
+python cert_monitor.py user add alice --role admin    # prompts for a password
+python cert_monitor.py user add bob --role viewer
+python cert_monitor.py user add bob --role admin      # existing user: resets password and role
+python cert_monitor.py user list
+python cert_monitor.py user remove bob
+```
+
+Passwords must be at least 12 characters and are stored as salted scrypt
+hashes. For scripts (Docker, provisioning), `--password-stdin` reads the
+password from standard input instead of prompting. Changes take effect
+immediately: a removed user is signed out on their next request, and a new
+role applies straight away.
 
 ### Access and security
 
-By default the dashboard only accepts connections from this machine
-(`127.0.0.1`). To reach it from other machines, set a password and choose
-an address to listen on:
-
-```bash
-export DASHBOARD_USER=admin            # optional, defaults to "admin"
-export DASHBOARD_PASSWORD='a-long-random-password'
-python cert_monitor.py serve --host 0.0.0.0 --port 8080
-```
-
-`serve` won't start on a non-local address unless `DASHBOARD_PASSWORD` is
-set. When it's set, every page and API call asks for that username and
-password (HTTP basic auth).
-
-Basic auth sends the password with every request. `serve` uses Flask's
-built-in server, which only speaks plain HTTP, so anyone watching the
-network can read the password. If you open the dashboard to other machines,
-put a reverse proxy that handles HTTPS in front of it (nginx, Caddy, etc.).
-
-Certificate fields come from remote servers, so a hostile server could put
-HTML or script in them. The dashboard HTML-escapes every value it displays,
-and it sends a strict Content-Security-Policy header.
+- **Listening address:** `serve` listens on `127.0.0.1` (this machine only)
+  unless you pass `--host`, e.g. `--host 0.0.0.0` to accept connections from
+  other machines.
+- **HTTPS:** `serve` runs [waitress](https://docs.pylonsproject.org/projects/waitress/),
+  a production-ready web server, but it only speaks plain HTTP. If people
+  sign in from other machines, put a reverse proxy that handles HTTPS in
+  front of it (nginx, Caddy, etc.). Then set `DASHBOARD_SECURE_COOKIES=1` so
+  browsers only send the login cookie over HTTPS.
+- **Sessions:** a login lasts 12 hours. Set `DASHBOARD_SECRET_KEY` to a long
+  random string (e.g. from `python -c "import secrets;
+  print(secrets.token_hex(32))"`) so people stay signed in when the server
+  restarts. Without it, a random key is generated at each start.
+- **Forged requests:** every form includes a CSRF token and the login cookie
+  is `SameSite=Lax`, so other websites can't submit actions on a signed-in
+  admin's behalf. HTTP basic auth only works on the read-only `/api/` routes.
+- **Login throttling:** there is none built in. If the dashboard is reachable
+  from the internet, rate-limit `/login` at your reverse proxy.
+- **Hostile certificates:** certificate fields come from remote servers, so
+  a hostile server could put HTML or script in them. The dashboard
+  HTML-escapes every value it displays, and it sends a strict
+  Content-Security-Policy header.
 
 ## Email alerts
 

@@ -1,4 +1,6 @@
 import base64
+import io
+import re
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -9,6 +11,8 @@ import cert_monitor
 import dashboard
 import storage
 from cert_monitor import CertCheckResult
+
+PASSWORD = "correct-horse-battery"
 
 
 def _iso(delta=timedelta()):
@@ -47,21 +51,51 @@ def _seed(db_path):
     conn.close()
 
 
-class DashboardTests(unittest.TestCase):
+def _add_user(db_path, username, role, password=PASSWORD):
+    conn = storage.connect(db_path)
+    storage.save_user(conn, username, dashboard.hash_password(password), role)
+    conn.commit()
+    conn.close()
+
+
+def _sign_in_as(client, username):
+    with client.session_transaction() as sess:
+        sess["user"] = username
+
+
+def _csrf_from(html):
+    return re.search(r'name="csrf_token" value="([^"]+)"', html).group(1)
+
+
+def _basic(user, password):
+    return {"Authorization": "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()}
+
+
+class DashboardTestCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.db_path = str(Path(self.tmp.name) / "dash.db")
         _seed(self.db_path)
-        self.client = dashboard.create_app(self.db_path, stale_hours=24).test_client()
+        _add_user(self.db_path, "alice", "admin")
+        _add_user(self.db_path, "victor", "viewer")
+        self.app = dashboard.create_app(self.db_path, stale_hours=24)
+        self.client = self.app.test_client()
 
     def tearDown(self):
         self.tmp.cleanup()
+
+
+class DashboardPageTests(DashboardTestCase):
+    def setUp(self):
+        super().setUp()
+        _sign_in_as(self.client, "victor")
 
     def test_index_lists_targets_problems_first(self):
         html = self.client.get("/").get_data(as_text=True)
         order = [html.index(h) for h in ("xss.example", "soon.example", "good.example", "old.example")]
         self.assertEqual(order, sorted(order))
         self.assertIn("Expiring soon", html)
+        self.assertIn("victor", html)
 
     def test_index_flags_stale_targets(self):
         html = self.client.get("/").get_data(as_text=True)
@@ -100,56 +134,176 @@ class DashboardTests(unittest.TestCase):
     def test_security_headers(self):
         headers = self.client.get("/").headers
         self.assertIn("default-src 'self'", headers["Content-Security-Policy"])
+        self.assertIn("form-action 'self'", headers["Content-Security-Policy"])
         self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
 
     def test_empty_database(self):
-        client = dashboard.create_app(str(Path(self.tmp.name) / "empty.db")).test_client()
+        db_path = str(Path(self.tmp.name) / "empty.db")
+        _add_user(db_path, "victor", "viewer")
+        client = dashboard.create_app(db_path).test_client()
+        _sign_in_as(client, "victor")
         self.assertIn("No checks recorded yet", client.get("/").get_data(as_text=True))
 
 
-class DashboardAuthTests(unittest.TestCase):
+class AuthenticationTests(DashboardTestCase):
+    def _login(self, username, password, next_path=None, csrf=None):
+        page = self.client.get("/login").get_data(as_text=True)
+        url = "/login" + (f"?next={next_path}" if next_path else "")
+        return self.client.post(
+            url,
+            data={"username": username, "password": password, "csrf_token": csrf or _csrf_from(page)},
+        )
+
+    def test_pages_redirect_to_login(self):
+        response = self.client.get("/targets/good.example/443")
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.headers["Location"], "/login?next=/targets/good.example/443")
+
+    def test_api_requires_credentials(self):
+        response = self.client.get("/api/status")
+        self.assertEqual(response.status_code, 401)
+        self.assertIn("Basic", response.headers["WWW-Authenticate"])
+
+    def test_stylesheet_is_public_so_login_page_renders(self):
+        with self.client.get("/static/style.css") as response:
+            self.assertEqual(response.status_code, 200)
+
+    def test_login_then_browse(self):
+        response = self._login("alice", PASSWORD, next_path="/targets/good.example/443")
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.headers["Location"], "/targets/good.example/443")
+        cookie = response.headers["Set-Cookie"]
+        self.assertIn("HttpOnly", cookie)
+        self.assertIn("SameSite=Lax", cookie)
+        self.assertEqual(self.client.get("/").status_code, 200)
+
+    def test_wrong_password_and_unknown_user_look_the_same(self):
+        for username, password in (("alice", "wrong-password-123"), ("mallory", PASSWORD)):
+            response = self._login(username, password)
+            self.assertEqual(response.status_code, 401)
+            self.assertIn("Incorrect username or password.", response.get_data(as_text=True))
+        self.assertEqual(self.client.get("/").status_code, 302)
+
+    def test_login_requires_csrf_token(self):
+        self.client.get("/login")
+        response = self.client.post("/login", data={"username": "alice", "password": PASSWORD})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(self._login("alice", PASSWORD, csrf="forged").status_code, 400)
+
+    def test_login_does_not_redirect_off_site(self):
+        for next_path in ("//evil.example/", "/\\evil.example/", "https://evil.example/"):
+            response = self._login("alice", PASSWORD, next_path=next_path)
+            self.assertEqual(response.headers["Location"], "/", next_path)
+
+    def test_removed_user_is_signed_out(self):
+        _sign_in_as(self.client, "victor")
+        self.assertEqual(self.client.get("/").status_code, 200)
+        conn = storage.connect(self.db_path)
+        storage.remove_user(conn, "victor")
+        conn.commit()
+        conn.close()
+        self.assertEqual(self.client.get("/").status_code, 302)
+
+    def test_sign_out(self):
+        self._login("alice", PASSWORD)
+        html = self.client.get("/").get_data(as_text=True)
+        self.assertEqual(self.client.post("/logout").status_code, 400)
+        response = self.client.post("/logout", data={"csrf_token": _csrf_from(html)})
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(self.client.get("/").status_code, 302)
+
+    def test_api_accepts_basic_auth(self):
+        self.assertEqual(self.client.get("/api/status", headers=_basic("victor", PASSWORD)).status_code, 200)
+        self.assertEqual(self.client.get("/api/status", headers=_basic("victor", "nope")).status_code, 401)
+
+    def test_basic_auth_is_not_accepted_for_pages(self):
+        # Browsers resend cached basic credentials on cross-site requests, so
+        # pages only accept the session cookie.
+        response = self.client.get("/", headers=_basic("alice", PASSWORD))
+        self.assertEqual(response.status_code, 302)
+
+
+class ServeCommandTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        db_path = str(Path(self.tmp.name) / "dash.db")
-        _seed(db_path)
-        self.client = dashboard.create_app(db_path, username="admin", password="s3cret").test_client()
+        self.db_path = str(Path(self.tmp.name) / "x.db")
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _auth(self, user, password):
-        token = base64.b64encode(f"{user}:{password}".encode()).decode()
-        return {"Authorization": f"Basic {token}"}
-
-    def test_requires_credentials(self):
-        for path in ("/", "/api/status", "/static/style.css"):
-            response = self.client.get(path)
-            self.assertEqual(response.status_code, 401)
-            self.assertIn("Basic", response.headers["WWW-Authenticate"])
-
-    def test_rejects_wrong_password(self):
-        self.assertEqual(self.client.get("/", headers=self._auth("admin", "nope")).status_code, 401)
-
-    def test_accepts_correct_credentials(self):
-        self.assertEqual(self.client.get("/", headers=self._auth("admin", "s3cret")).status_code, 200)
-
-
-class ServeCommandTests(unittest.TestCase):
-    def test_refuses_public_bind_without_password(self):
-        with tempfile.TemporaryDirectory() as tmp, \
-                mock.patch.dict("os.environ", {}, clear=True), \
-                mock.patch("dashboard.Flask.run") as run, mock.patch("sys.stderr"):
-            code = cert_monitor.main(["serve", "--db", str(Path(tmp) / "x.db"), "--host", "0.0.0.0"])
+    def test_refuses_to_start_without_accounts(self):
+        with mock.patch.dict("os.environ", {}, clear=True), \
+                mock.patch("cert_monitor.waitress.serve") as serve, mock.patch("sys.stderr"):
+            code = cert_monitor.main(["serve", "--db", self.db_path])
         self.assertEqual(code, 2)
-        run.assert_not_called()
+        serve.assert_not_called()
 
-    def test_serves_on_loopback_without_password(self):
-        with tempfile.TemporaryDirectory() as tmp, \
-                mock.patch.dict("os.environ", {}, clear=True), \
-                mock.patch("dashboard.Flask.run") as run:
-            code = cert_monitor.main(["serve", "--db", str(Path(tmp) / "x.db")])
+    def test_serves_once_an_account_exists(self):
+        _add_user(self.db_path, "alice", "admin")
+        with mock.patch.dict("os.environ", {}, clear=True), \
+                mock.patch("cert_monitor.waitress.serve") as serve, mock.patch("sys.stdout"):
+            code = cert_monitor.main(["serve", "--db", self.db_path, "--host", "0.0.0.0", "--port", "9000"])
         self.assertEqual(code, 0)
-        run.assert_called_once_with(host="127.0.0.1", port=8080)
+        self.assertEqual(serve.call_args.kwargs, {"host": "0.0.0.0", "port": 9000})
+
+
+class UserCommandTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self.tmp.name) / "users.db")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run(self, *argv, stdin=""):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch("sys.stdin", io.StringIO(stdin)), \
+                mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
+            code = cert_monitor.main(["user", *argv, "--db", self.db_path])
+        return code, out.getvalue() + err.getvalue()
+
+    def _user(self, username):
+        conn = storage.connect(self.db_path)
+        try:
+            return storage.get_user(conn, username)
+        finally:
+            conn.close()
+
+    def test_add_list_update_remove(self):
+        code, out = self._run("add", "alice", "--role", "viewer", "--password-stdin", stdin=PASSWORD + "\n")
+        self.assertEqual(code, 0)
+        self.assertIn("created viewer account 'alice'", out)
+        user = self._user("alice")
+        self.assertNotIn(PASSWORD, user["password_hash"])
+        self.assertTrue(dashboard.check_password_hash(user["password_hash"], PASSWORD))
+
+        code, out = self._run("add", "alice", "--role", "admin", "--password-stdin", stdin="another-long-password\n")
+        self.assertIn("updated admin account 'alice'", out)
+        self.assertEqual(self._user("alice")["role"], "admin")
+
+        code, out = self._run("list")
+        self.assertIn("alice", out)
+        self.assertIn("admin", out)
+
+        self.assertEqual(self._run("remove", "alice")[0], 0)
+        self.assertIsNone(self._user("alice"))
+        self.assertEqual(self._run("remove", "alice")[0], 2)
+
+    def test_rejects_short_password(self):
+        code, out = self._run("add", "bob", "--role", "admin", "--password-stdin", stdin="short\n")
+        self.assertEqual(code, 2)
+        self.assertIn("at least 12 characters", out)
+        self.assertIsNone(self._user("bob"))
+
+    def test_rejects_odd_usernames(self):
+        code, _ = self._run("add", "bob smith<script>", "--role", "admin", "--password-stdin", stdin=PASSWORD)
+        self.assertEqual(code, 2)
+
+    def test_prompted_passwords_must_match(self):
+        with mock.patch("cert_monitor.getpass.getpass", side_effect=[PASSWORD, PASSWORD + "x"]):
+            code, out = self._run("add", "bob", "--role", "admin")
+        self.assertEqual(code, 2)
+        self.assertIn("don't match", out)
 
 
 if __name__ == "__main__":

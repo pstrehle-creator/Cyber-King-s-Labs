@@ -10,6 +10,15 @@
 <body>
   <header class="site-header">
     <a class="brand" href="{{ url_for('index') }}">cert-monitor</a>
+    {% if g.user %}
+    <div class="account">
+      <span>{{ g.user.username }} <span class="role">{{ g.user.role }}</span></span>
+      <form method="post" action="{{ url_for('logout') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <button type="submit" class="link-button">Sign out</button>
+      </form>
+    </div>
+    {% endif %}
   </header>
   <main>
     {% block content %}{% endblock %}
