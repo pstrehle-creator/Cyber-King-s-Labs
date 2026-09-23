@@ -278,6 +278,46 @@ class Phase2MigrationTests(unittest.TestCase):
             conn.close()
 
 
+class PruneTests(unittest.TestCase):
+    def setUp(self):
+        self.conn = storage.connect(":memory:")
+
+    def tearDown(self):
+        self.conn.close()
+
+    def _record(self, host, days_ago):
+        target_id = storage.upsert_target(self.conn, host, 443)
+        checked_at = (datetime.now(timezone.utc) - timedelta(days=days_ago)).isoformat(timespec="seconds")
+        storage.record_check(
+            self.conn, target_id,
+            CertCheckResult(hostname=host, port=443, status="OK", checked_at=checked_at),
+        )
+
+    def _count(self, host):
+        return len(storage.target_history(self.conn, host, 443, limit=100))
+
+    def test_deletes_old_checks_but_keeps_recent_and_latest(self):
+        for days_ago in (200, 150, 100, 10, 1):
+            self._record("busy.example", days_ago)
+        # A target that stopped being checked long ago keeps its last result.
+        self._record("retired.example", 400)
+        self._record("retired.example", 300)
+
+        with mock.patch("sys.stdout"):
+            self.assertEqual(cert_monitor.cmd_prune(mock.Mock(keep_days=90), self.conn), 0)
+
+        self.assertEqual(self._count("busy.example"), 2)
+        self.assertEqual(self._count("retired.example"), 1)
+        latest = storage.target_history(self.conn, "retired.example", 443, limit=1)[0]
+        self.assertTrue(latest["checked_at"].startswith(
+            (datetime.now(timezone.utc) - timedelta(days=300)).date().isoformat()
+        ))
+
+    def test_keep_days_must_be_positive(self):
+        with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+            cert_monitor.build_arg_parser().parse_args(["prune", "--keep-days", "0"])
+
+
 class SlackTests(unittest.TestCase):
     ALERT = (
         CertCheckResult(

@@ -29,7 +29,7 @@ import sys
 import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
 
@@ -378,6 +378,14 @@ def cmd_history(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
     return 0
 
 
+def cmd_prune(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=args.keep_days)).isoformat(timespec="seconds")
+    deleted = storage.prune_checks(conn, cutoff)
+    conn.commit()
+    print(f"[info] deleted {deleted} check(s) older than {args.keep_days} days")
+    return 0
+
+
 def _is_loopback(host: str) -> bool:
     if host == "localhost":
         return True
@@ -404,6 +412,16 @@ def cmd_serve(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
     )
     app.run(host=args.host, port=args.port)
     return 0
+
+
+def _positive_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a whole number, got {value!r}")
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return number
 
 
 def _parse_tiers(value: str) -> list[int]:
@@ -447,6 +465,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     history.add_argument("target", nargs="?", help="host or host:port to show history for")
     history.add_argument("--limit", type=int, default=20, help="max rows for one target (default: 20)")
     history.set_defaults(func=cmd_history)
+
+    prune = subparsers.add_parser(
+        "prune", parents=[common], help="delete old check history (each target's latest check is kept)"
+    )
+    prune.add_argument(
+        "--keep-days", type=_positive_int, default=90,
+        help="keep checks from the last N days (default: 90)",
+    )
+    prune.set_defaults(func=cmd_prune)
 
     serve = subparsers.add_parser("serve", parents=[common], help="run the read-only web dashboard")
     serve.add_argument("--host", default="127.0.0.1", help="address to listen on (default: 127.0.0.1)")

@@ -60,6 +60,18 @@ python cert_monitor.py history
 python cert_monitor.py history example.com --limit 20
 ```
 
+### Clean up old history
+
+```bash
+# delete checks older than 90 days (the default)
+python cert_monitor.py prune --keep-days 90
+```
+
+Each target's most recent check is always kept, even if it's older than
+the cutoff, so targets you've stopped checking still show on the
+dashboard. Sent alerts are never deleted, so you keep a full record of who
+was told what.
+
 ### Exit codes
 
 `check` returns `0` if everything is OK, `1` if something is expiring soon,
@@ -186,6 +198,8 @@ Then add a crontab entry with `crontab -e`:
 ```cron
 # every 6 hours; alerts are only sent when something changes
 0 */6 * * * . $HOME/.cert-monitor.env && cd /path/to/cert-monitor && ./venv/bin/python cert_monitor.py check --targets-file targets.txt --email --slack >> cert_monitor.log 2>&1
+# weekly on Sunday at 3am, trim history older than 90 days
+0 3 * * 0 cd /path/to/cert-monitor && ./venv/bin/python cert_monitor.py prune --keep-days 90 >> cert_monitor.log 2>&1
 ```
 
 Frequent runs are safe because alerts are deduplicated. More runs just mean
@@ -206,4 +220,4 @@ status, so they don't need internet access.
 - ~~**Phase 2** — SQLite history, deduplicated alerts, cron.~~
 - ~~**Phase 3** — Web dashboard + Slack webhook alerts.~~
 - **Phase 4** — Certificate Transparency log discovery, escalation chains,
-  RBAC, history retention/pruning, Docker Compose packaging.
+  RBAC, history cleanup, Docker Compose packaging.

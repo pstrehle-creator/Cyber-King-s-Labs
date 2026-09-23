@@ -169,6 +169,20 @@ def target_history(
     ).fetchall()
 
 
+def prune_checks(conn: sqlite3.Connection, older_than: str) -> int:
+    """Delete checks recorded before `older_than` (ISO timestamp), always
+    keeping each target's latest check so it stays on the dashboard."""
+    cursor = conn.execute(
+        """
+        DELETE FROM checks
+        WHERE checked_at < ?
+          AND id NOT IN (SELECT MAX(id) FROM checks GROUP BY target_id)
+        """,
+        (older_than,),
+    )
+    return cursor.rowcount
+
+
 def target_alerts(conn: sqlite3.Connection, target_id: int, limit: int) -> list[sqlite3.Row]:
     return conn.execute(
         "SELECT * FROM alerts WHERE target_id = ? ORDER BY id DESC LIMIT ?",
