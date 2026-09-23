@@ -10,7 +10,7 @@ chain validation. Also serves a web dashboard over the history.
 Usage:
     python cert_monitor.py targets add example.com github.com:443
     python cert_monitor.py check
-    python cert_monitor.py check example.com github.com:443
+    python cert_monitor.py check example.com github.com:443 smtp://mail.example.com:587
     python cert_monitor.py check --targets-file targets.txt --email --slack
     python cert_monitor.py history
     python cert_monitor.py history example.com --limit 10
@@ -26,8 +26,10 @@ from __future__ import annotations
 import argparse
 import functools
 import getpass
+import imaplib
 import json
 import os
+import poplib
 import re
 import smtplib
 import socket
@@ -36,6 +38,7 @@ import ssl
 import sys
 import urllib.error
 import urllib.request
+from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
@@ -76,10 +79,11 @@ class CertCheckResult:
     chain_valid: bool = True
     error: str | None = None
     checked_at: str = field(default_factory=_utc_now_iso)
+    protocol: str = "tls"
 
     @property
     def target(self) -> str:
-        return targets.format_target(self.hostname, self.port)
+        return targets.format_target(self.hostname, self.port, self.protocol)
 
 
 def target_lines(text: str) -> list[str]:
@@ -91,7 +95,7 @@ def parse_targets_file(path: Path) -> list[str]:
     return target_lines(path.read_text())
 
 
-def parse_targets_or_report(raw_targets: list[str]) -> list[tuple[str, int]] | None:
+def parse_targets_or_report(raw_targets: list[str]) -> list[tuple[str, int, str]] | None:
     """Parse every target, printing each invalid one. Returns None if any
     were invalid, so a typo is fixed rather than silently skipped."""
     parsed, ok = [], True
@@ -114,23 +118,66 @@ def _actor(args: argparse.Namespace) -> str | None:
         return None
 
 
-def _fetch_cert_der(hostname: str, port: int, timeout: float) -> bytes:
+# Errors a mail server can answer with instead of upgrading to TLS.
+STARTTLS_ERRORS = (smtplib.SMTPException, imaplib.IMAP4.error, poplib.error_proto)
+
+
+class StartTLSError(Exception):
+    pass
+
+
+@contextmanager
+def _tls_connection(hostname: str, port: int, timeout: float, ctx: ssl.SSLContext, protocol: str):
+    """Yield a TLS socket to the target: directly, or by connecting in
+    plaintext and upgrading with the protocol's STARTTLS command."""
+    if protocol == "tls":
+        with socket.create_connection((hostname, port), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=hostname) as tls_sock:
+                yield tls_sock
+        return
+
+    # These clients are closed without a polite QUIT/LOGOUT, and errors while
+    # closing are ignored: after a failed handshake the client's socket is
+    # already unusable, and a cleanup error would hide the real one.
+    if protocol == "smtp":
+        client = smtplib.SMTP(hostname, port, timeout=timeout)
+        upgrade, close = functools.partial(client.starttls, context=ctx), client.close
+    elif protocol == "imap":
+        client = imaplib.IMAP4(hostname, port, timeout=timeout)
+        upgrade, close = functools.partial(client.starttls, ssl_context=ctx), client.shutdown
+    elif protocol == "pop3":
+        client = poplib.POP3(hostname, port, timeout=timeout)
+        upgrade, close = functools.partial(client.stls, context=ctx), client.close
+    else:
+        raise ValueError(f"unknown protocol {protocol!r}")
+    try:
+        try:
+            upgrade()
+        except STARTTLS_ERRORS as exc:
+            raise StartTLSError(f"{protocol.upper()} STARTTLS failed: {exc}") from exc
+        yield client.sock
+    finally:
+        with suppress(OSError):
+            close()
+
+
+def _fetch_cert_der(hostname: str, port: int, timeout: float, protocol: str = "tls") -> bytes:
     """Retrieve the peer certificate without verifying it, so expired or
     untrusted certs can still be parsed. Trust is checked in _check_chain_valid()."""
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-    with socket.create_connection((hostname, port), timeout=timeout) as sock:
-        with ctx.wrap_socket(sock, server_hostname=hostname) as tls_sock:
-            return tls_sock.getpeercert(binary_form=True)
+    with _tls_connection(hostname, port, timeout, ctx, protocol) as tls_sock:
+        return tls_sock.getpeercert(binary_form=True)
 
 
-def _check_chain_valid(hostname: str, port: int, timeout: float) -> tuple[bool, str | None]:
+def _check_chain_valid(
+    hostname: str, port: int, timeout: float, protocol: str = "tls"
+) -> tuple[bool, str | None]:
     ctx = ssl.create_default_context()
     try:
-        with socket.create_connection((hostname, port), timeout=timeout) as sock:
-            with ctx.wrap_socket(sock, server_hostname=hostname):
-                return True, None
+        with _tls_connection(hostname, port, timeout, ctx, protocol):
+            return True, None
     except ssl.SSLCertVerificationError as exc:
         return False, exc.verify_message or str(exc)
 
@@ -155,16 +202,22 @@ def _san_dns_names(cert: x509.Certificate) -> list[str]:
         return []
 
 
-def check_target(hostname: str, port: int, timeout: float, threshold: int) -> CertCheckResult:
+def check_target(
+    hostname: str, port: int, timeout: float, threshold: int, protocol: str = "tls"
+) -> CertCheckResult:
     try:
-        der = _fetch_cert_der(hostname, port, timeout)
-        chain_valid, chain_error = _check_chain_valid(hostname, port, timeout)
-    except OSError as exc:
-        return CertCheckResult(hostname=hostname, port=port, status="UNREACHABLE", error=str(exc))
+        der = _fetch_cert_der(hostname, port, timeout, protocol)
+        chain_valid, chain_error = _check_chain_valid(hostname, port, timeout, protocol)
+    except (OSError, StartTLSError, *STARTTLS_ERRORS) as exc:
+        return CertCheckResult(
+            hostname=hostname, port=port, protocol=protocol, status="UNREACHABLE",
+            error=str(exc) or type(exc).__name__,
+        )
 
     if der is None:
         return CertCheckResult(
-            hostname=hostname, port=port, status="UNREACHABLE", error="peer presented no certificate"
+            hostname=hostname, port=port, protocol=protocol, status="UNREACHABLE",
+            error="peer presented no certificate",
         )
 
     cert = x509.load_der_x509_certificate(der)
@@ -185,6 +238,7 @@ def check_target(hostname: str, port: int, timeout: float, threshold: int) -> Ce
     return CertCheckResult(
         hostname=hostname,
         port=port,
+        protocol=protocol,
         status=status,
         days_remaining=days_remaining,
         not_before=not_before.isoformat(),
@@ -232,7 +286,7 @@ def find_new_alerts(
 
 
 def print_table(rows: list[dict], show_time: bool = False) -> None:
-    labels = [targets.format_target(r["hostname"], r["port"]) for r in rows]
+    labels = [targets.format_target(r["hostname"], r["port"], r.get("protocol", "tls")) for r in rows]
     width = max([len("TARGET"), *map(len, labels)])
     time_col = f"{'CHECKED AT':<26} " if show_time else ""
     header = f"{time_col}{'TARGET':<{width}} {'STATUS':<15} {'DAYS':>6}  {'NOT AFTER':<26} ISSUER / ERROR"
@@ -412,7 +466,7 @@ def cmd_check(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
         if to_check is None:
             return 2
     else:
-        to_check = [(t["hostname"], t["port"]) for t in storage.active_targets(conn)]
+        to_check = [(t["hostname"], t["port"], t["protocol"]) for t in storage.active_targets(conn)]
         if not to_check:
             print(
                 "[error] no hosts to check: add some with 'targets add HOST', "
@@ -422,9 +476,9 @@ def cmd_check(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
             return 2
 
     checked = []
-    for hostname, port in to_check:
-        result = check_target(hostname, port, timeout=args.timeout, threshold=args.threshold)
-        target_id = storage.upsert_target(conn, hostname, port)
+    for hostname, port, protocol in to_check:
+        result = check_target(hostname, port, args.timeout, args.threshold, protocol)
+        target_id = storage.upsert_target(conn, hostname, port, protocol)
         storage.record_check(conn, target_id, result)
         checked.append((target_id, result))
     conn.commit()
@@ -477,10 +531,10 @@ def cmd_history(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
         parsed = parse_targets_or_report([args.target])
         if parsed is None:
             return 2
-        hostname, port = parsed[0]
+        hostname, port, protocol = parsed[0]
         rows = storage.target_history(conn, hostname, port, args.limit)
         if not rows:
-            print(f"no checks recorded for {targets.format_target(hostname, port)}")
+            print(f"no checks recorded for {targets.format_target(hostname, port, protocol)}")
             return 0
         print_table([dict(r) for r in rows], show_time=True)
     else:
@@ -615,9 +669,9 @@ def cmd_ack(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
     parsed = parse_targets_or_report([args.target])
     if parsed is None:
         return 2
-    hostname, port = parsed[0]
-    label = targets.format_target(hostname, port)
+    hostname, port, _ = parsed[0]
     target = storage.get_target(conn, hostname, port)
+    label = targets.format_target(hostname, port, target["protocol"] if target else "tls")
     active = storage.active_alert(conn, target["id"]) if target else None
     if active is None:
         print(f"[error] {label} has no open alert to acknowledge", file=sys.stderr)
@@ -637,12 +691,13 @@ def _add_targets(conn: sqlite3.Connection, raw_targets: list[str], by: str) -> i
     if parsed is None:
         return 2
     now = _utc_now_iso()
-    for hostname, port in parsed:
-        outcome = storage.add_target(conn, hostname, port, by, now)
-        label = targets.format_target(hostname, port)
+    for hostname, port, protocol in parsed:
+        outcome = storage.add_target(conn, hostname, port, by, now, protocol)
+        label = targets.format_target(hostname, port, protocol)
         print({
             "added": f"[info] now monitoring {label}",
             "restored": f"[info] monitoring {label} again",
+            "updated": f"[info] now checking {label}",
             "unchanged": f"[info] already monitoring {label}",
         }[outcome])
     conn.commit()
@@ -672,9 +727,9 @@ def cmd_targets_remove(args: argparse.Namespace, conn: sqlite3.Connection) -> in
     if by is None or parsed is None:
         return 2
     code = 0
-    for hostname, port in parsed:
-        label = targets.format_target(hostname, port)
+    for hostname, port, _ in parsed:
         target = storage.get_target(conn, hostname, port)
+        label = targets.format_target(hostname, port, target["protocol"] if target else "tls")
         if target is None or not storage.remove_target(conn, target["id"], by, _utc_now_iso()):
             print(f"[error] {label} isn't being monitored", file=sys.stderr)
             code = 2
@@ -689,7 +744,7 @@ def cmd_targets_list(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
     if not rows:
         print("no hosts yet; add some with: python cert_monitor.py targets add example.com")
         return 0
-    labels = [targets.format_target(r["hostname"], r["port"]) for r in rows]
+    labels = [targets.format_target(r["hostname"], r["port"], r["protocol"]) for r in rows]
     width = max(len("TARGET"), *map(len, labels))
     print(f"{'TARGET':<{width}}  {'STATE':<9} {'LAST STATUS':<15} {'DAYS':>5}  LAST CHECKED")
     for label, r in zip(labels, rows):

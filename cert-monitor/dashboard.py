@@ -103,7 +103,7 @@ def create_app(
     app.jinja_env.filters["fmt_time"] = _fmt_time
     app.jinja_env.filters["status_label"] = lambda s: STATUS_LABELS.get(s, s)
     app.jinja_env.filters["alert_label"] = _alert_label
-    app.jinja_env.filters["target_label"] = lambda t: targets.format_target(t["hostname"], t["port"])
+    app.jinja_env.filters["target_label"] = lambda t: targets.format_target(t["hostname"], t["port"], t["protocol"])
     stale_after = timedelta(hours=stale_hours)
 
     def db():
@@ -239,16 +239,17 @@ def create_app(
     @require_admin
     def add_host():
         try:
-            hostname, port = targets.parse_target(request.form.get("target", "")[:300])
+            hostname, port, protocol = targets.parse_target(request.form.get("target", "")[:300])
         except ValueError as exc:
             flash(f"Couldn't add that host: {exc}.", "error")
             return redirect(url_for("hosts"))
-        outcome = storage.add_target(db(), hostname, port, g.user["username"], now_iso())
+        outcome = storage.add_target(db(), hostname, port, g.user["username"], now_iso(), protocol)
         db().commit()
-        label = targets.format_target(hostname, port)
+        label = targets.format_target(hostname, port, protocol)
         flash({
             "added": f"Now monitoring {label}. It will be checked on the next scheduled run.",
             "restored": f"Monitoring {label} again.",
+            "updated": f"Now checking {label}.",
             "unchanged": f"{label} is already being monitored.",
         }[outcome], "info")
         return redirect(url_for("hosts"))
@@ -261,9 +262,9 @@ def create_app(
             abort(404)
         if storage.remove_target(db(), target_id, g.user["username"], now_iso()):
             db().commit()
+            label = targets.format_target(target_row["hostname"], target_row["port"], target_row["protocol"])
             flash(
-                f"Stopped monitoring {targets.format_target(target_row['hostname'], target_row['port'])}. "
-                "Its history is kept, and you can restore it below.",
+                f"Stopped monitoring {label}. Its history is kept, and you can restore it below.",
                 "info",
             )
         return redirect(url_for("hosts"))
@@ -274,9 +275,12 @@ def create_app(
         target_row = storage.get_target_by_id(db(), target_id)
         if target_row is None:
             abort(404)
-        storage.add_target(db(), target_row["hostname"], target_row["port"], g.user["username"], now_iso())
+        storage.add_target(
+            db(), target_row["hostname"], target_row["port"], g.user["username"], now_iso(), target_row["protocol"]
+        )
         db().commit()
-        flash(f"Monitoring {targets.format_target(target_row['hostname'], target_row['port'])} again.", "info")
+        label = targets.format_target(target_row["hostname"], target_row["port"], target_row["protocol"])
+        flash(f"Monitoring {label} again.", "info")
         if request.form.get("return_to") == "target":
             return redirect(url_for("target", hostname=target_row["hostname"], port=target_row["port"]))
         return redirect(url_for("hosts"))

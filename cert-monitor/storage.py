@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS targets (
     active INTEGER NOT NULL DEFAULT 1,
     changed_by TEXT,
     changed_at TEXT,
+    protocol TEXT NOT NULL DEFAULT 'tls',
     UNIQUE (hostname, port)
 );
 
@@ -128,13 +129,15 @@ def _add_alerted_at_column(conn: sqlite3.Connection) -> None:
 
 
 def _add_target_management_columns(conn: sqlite3.Connection) -> None:
-    """Databases from before hosts could be managed in the dashboard. Every
-    existing target stays active."""
+    """Databases from before hosts could be managed in the dashboard (every
+    existing target stays active) or checked over STARTTLS (every existing
+    target is direct TLS)."""
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(targets)")}
     for name, declaration in (
         ("active", "INTEGER NOT NULL DEFAULT 1"),
         ("changed_by", "TEXT"),
         ("changed_at", "TEXT"),
+        ("protocol", "TEXT NOT NULL DEFAULT 'tls'"),
     ):
         if name not in columns:
             conn.execute(f"ALTER TABLE targets ADD COLUMN {name} {declaration}")
@@ -159,15 +162,15 @@ def _migrate_phase2_alert_state(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def upsert_target(conn: sqlite3.Connection, hostname: str, port: int) -> int:
+def upsert_target(conn: sqlite3.Connection, hostname: str, port: int, protocol: str = "tls") -> int:
     """Get or create a target, making it active: a target someone explicitly
     asks to check is monitored again even if it was removed earlier."""
     conn.execute(
         """
-        INSERT INTO targets (hostname, port) VALUES (?, ?)
-        ON CONFLICT (hostname, port) DO UPDATE SET active = 1
+        INSERT INTO targets (hostname, port, protocol) VALUES (?, ?, ?)
+        ON CONFLICT (hostname, port) DO UPDATE SET active = 1, protocol = excluded.protocol
         """,
-        (hostname, port),
+        (hostname, port, protocol),
     )
     row = conn.execute(
         "SELECT id FROM targets WHERE hostname = ? AND port = ?", (hostname, port)
@@ -175,20 +178,26 @@ def upsert_target(conn: sqlite3.Connection, hostname: str, port: int) -> int:
     return row["id"]
 
 
-def add_target(conn: sqlite3.Connection, hostname: str, port: int, actor: str, at: str) -> str:
-    """Start monitoring a target. Returns "added", "restored" or "unchanged"."""
+def add_target(
+    conn: sqlite3.Connection, hostname: str, port: int, actor: str, at: str, protocol: str = "tls"
+) -> str:
+    """Start monitoring a target. Returns "added", "restored", "updated" (its
+    protocol changed) or "unchanged"."""
     existing = get_target(conn, hostname, port)
-    if existing is not None and existing["active"]:
+    if existing is not None and existing["active"] and existing["protocol"] == protocol:
         return "unchanged"
     conn.execute(
         """
-        INSERT INTO targets (hostname, port, active, changed_by, changed_at) VALUES (?, ?, 1, ?, ?)
+        INSERT INTO targets (hostname, port, protocol, active, changed_by, changed_at) VALUES (?, ?, ?, 1, ?, ?)
         ON CONFLICT (hostname, port) DO UPDATE SET
-            active = 1, changed_by = excluded.changed_by, changed_at = excluded.changed_at
+            active = 1, protocol = excluded.protocol,
+            changed_by = excluded.changed_by, changed_at = excluded.changed_at
         """,
-        (hostname, port, actor, at),
+        (hostname, port, protocol, actor, at),
     )
-    return "added" if existing is None else "restored"
+    if existing is None:
+        return "added"
+    return "restored" if not existing["active"] else "updated"
 
 
 def remove_target(conn: sqlite3.Connection, target_id: int, actor: str, at: str) -> bool:
@@ -341,7 +350,7 @@ def target_acks(conn: sqlite3.Connection, target_id: int, limit: int) -> list[sq
 def latest_checks(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute(
         """
-        SELECT t.hostname, t.port, c.*
+        SELECT t.hostname, t.port, t.protocol, c.*
         FROM checks c
         JOIN targets t ON t.id = c.target_id
         WHERE t.active = 1
@@ -356,7 +365,7 @@ def target_history(
 ) -> list[sqlite3.Row]:
     return conn.execute(
         """
-        SELECT t.hostname, t.port, c.*
+        SELECT t.hostname, t.port, t.protocol, c.*
         FROM checks c
         JOIN targets t ON t.id = c.target_id
         WHERE t.hostname = ? AND t.port = ?

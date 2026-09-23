@@ -33,7 +33,8 @@ python cert_monitor.py targets remove vpn.example.com
 
 A host is `hostname` or `hostname:port` (the default port is 443).
 Internal names like `intranet` and IP addresses work. Write IPv6
-addresses in brackets, like `[2001:db8::1]:443`. Removing a host stops
+addresses in brackets, like `[2001:db8::1]:443`. For mail servers, see
+[Mail servers](#mail-servers-starttls) below. Removing a host stops
 checks and alerts for it, but keeps its history. Adding it again restores
 it. Each add and remove records who made it (`--by`, defaulting to your
 login name).
@@ -77,7 +78,35 @@ Each target gets one of these statuses:
 | `EXPIRING_SOON` | Trusted chain, `--threshold` days or fewer left                |
 | `EXPIRED`       | Past its expiry date                                           |
 | `INVALID_CHAIN` | Not expired, but untrusted (self-signed, unknown CA, wrong hostname, ...) |
-| `UNREACHABLE`   | DNS failure, connection refused, timeout, or no certificate    |
+| `UNREACHABLE`   | DNS failure, connection refused, timeout, no certificate, or a mail server that won't start TLS |
+
+### Mail servers (STARTTLS)
+
+Mail servers often start a connection in plain text and then switch to TLS
+with a STARTTLS command. To check their certificates that way, add a
+protocol prefix:
+
+```bash
+python cert_monitor.py targets add smtp://mail.example.com:587 imap://mail.example.com pop3://mail.example.com
+```
+
+| Prefix    | Protocol | Default port |
+|-----------|----------|--------------|
+| `smtp://` | SMTP     | 25           |
+| `imap://` | IMAP     | 143          |
+| `pop3://` | POP3     | 110          |
+
+Ports that use TLS from the first byte (465 for SMTP, 993 for IMAP, 995
+for POP3) don't need a prefix. Add them like any other host, e.g.
+`mail.example.com:993`.
+
+The check only asks the server to start TLS and reads its certificate. It
+never logs in or sends mail. If the server doesn't offer STARTTLS, the host
+is reported as `UNREACHABLE` with a reason like
+`SMTP STARTTLS failed: STARTTLS extension not supported by server`. Many
+home ISPs and cloud providers block outgoing connections to port 25. If
+every `smtp://` host on port 25 is unreachable, run the check from
+somewhere that allows it, or check port 587 instead.
 
 ### View history
 
@@ -432,7 +461,6 @@ All four planned phases are done:
 4. Certificate Transparency discovery, alert acknowledgement and escalation,
    admin/viewer accounts, history cleanup, Docker Compose packaging
 
-Since then, hosts are managed in the database and on the dashboard.
-Possible next steps: check certificates on non-HTTPS services that upgrade
-to TLS with STARTTLS (SMTP, IMAP), and add PagerDuty or Microsoft Teams
-alert channels.
+Since then, hosts are managed in the database and on the dashboard, and
+mail servers can be checked over STARTTLS. Possible next step: PagerDuty
+or Microsoft Teams alert channels.

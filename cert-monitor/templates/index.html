@@ -45,7 +45,7 @@
     <tbody>
       {% for r in rows %}
       <tr>
-        <td class="target"><a href="{{ url_for('target', hostname=r.hostname, port=r.port) }}">{{ r.hostname }}:{{ r.port }}</a></td>
+        <td class="target"><a href="{{ url_for('target', hostname=r.hostname, port=r.port) }}">{{ r|target_label }}</a></td>
         <td>
           <span class="badge status-{{ r.status|lower }}">{{ r.status|status_label }}</span>
           {% if r.alert and r.alert.ack %}<span class="badge acked hide-sm">acknowledged</span>{% endif %}

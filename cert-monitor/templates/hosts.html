@@ -10,9 +10,9 @@
   <h2>Add a host</h2>
   <form method="post" action="{{ url_for('add_host') }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-    <label for="target" class="muted">Hostname, optionally with a port (default 443)</label>
+    <label for="target" class="muted">Hostname, optionally with a port (default 443). For mail servers that use STARTTLS, prefix smtp://, imap:// or pop3://.</label>
     <div class="form-row">
-      <input id="target" name="target" required maxlength="300" placeholder="e.g. vpn.example.com or mail.example.com:993">
+      <input id="target" name="target" required maxlength="300" placeholder="e.g. vpn.example.com or smtp://mail.example.com:587">
       <button type="submit">Add</button>
     </div>
   </form>

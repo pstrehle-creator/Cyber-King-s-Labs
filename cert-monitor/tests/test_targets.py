@@ -14,13 +14,18 @@ from test_dashboard import DashboardTestCase, _csrf_from, _sign_in_as
 class ParseTargetTests(unittest.TestCase):
     def test_valid_targets(self):
         cases = {
-            "example.com": ("example.com", 443),
-            " Mail.Example.COM.:993 ": ("mail.example.com", 993),
-            "intranet": ("intranet", 443),
-            "_dmarc-host.corp.local:8443": ("_dmarc-host.corp.local", 8443),
-            "10.0.0.5:636": ("10.0.0.5", 636),
-            "[2001:db8::1]": ("2001:db8::1", 443),
-            "[2001:DB8::1]:8443": ("2001:db8::1", 8443),
+            "example.com": ("example.com", 443, "tls"),
+            " Mail.Example.COM.:993 ": ("mail.example.com", 993, "tls"),
+            "intranet": ("intranet", 443, "tls"),
+            "_dmarc-host.corp.local:8443": ("_dmarc-host.corp.local", 8443, "tls"),
+            "10.0.0.5:636": ("10.0.0.5", 636, "tls"),
+            "[2001:db8::1]": ("2001:db8::1", 443, "tls"),
+            "[2001:DB8::1]:8443": ("2001:db8::1", 8443, "tls"),
+            "smtp://mail.example.com": ("mail.example.com", 25, "smtp"),
+            "SMTP://Mail.Example.com:587": ("mail.example.com", 587, "smtp"),
+            "imap://mail.example.com": ("mail.example.com", 143, "imap"),
+            "pop3://mail.example.com": ("mail.example.com", 110, "pop3"),
+            "smtp://[2001:db8::1]": ("2001:db8::1", 25, "smtp"),
         }
         for raw, expected in cases.items():
             self.assertEqual(targets.parse_target(raw), expected, raw)
@@ -29,7 +34,7 @@ class ParseTargetTests(unittest.TestCase):
         for raw in (
             "", "example.com:", "example.com:0", "example.com:70000", "example.com:https",
             "2001:db8::1", "[2001:db8::1", "[not-ipv6]:443", "[::1]x", "exa mple.com",
-            "https://example.com", "example.com/path", "a" * 64 + ".com", "-bad.example.com",
+            "https://example.com", "tls://example.com", "smtp://", "smtp://bad host", "example.com/path", "a" * 64 + ".com", "-bad.example.com",
         ):
             with self.assertRaises(ValueError, msg=raw):
                 targets.parse_target(raw)
@@ -37,6 +42,7 @@ class ParseTargetTests(unittest.TestCase):
     def test_format_target(self):
         self.assertEqual(targets.format_target("example.com", 443), "example.com:443")
         self.assertEqual(targets.format_target("2001:db8::1", 443), "[2001:db8::1]:443")
+        self.assertEqual(targets.format_target("mail.example.com", 587, "smtp"), "smtp://mail.example.com:587")
 
 
 class TargetsCommandTests(unittest.TestCase):
@@ -145,7 +151,7 @@ class TargetColumnsMigrationTests(unittest.TestCase):
             conn = storage.connect(db_path)
             rows = storage.active_targets(conn)
             conn.close()
-        self.assertEqual([r["hostname"] for r in rows], ["example.com"])
+        self.assertEqual([(r["hostname"], r["protocol"]) for r in rows], [("example.com", "tls")])
 
 
 class HostsPageTests(DashboardTestCase):
