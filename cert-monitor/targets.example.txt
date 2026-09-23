@@ -1,0 +1,6 @@
+# One target per line: host or host:port (default port 443).
+# Lines starting with # are ignored.
+example.com
+github.com
+expired.badssl.com
+self-signed.badssl.com
