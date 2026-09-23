@@ -2,11 +2,12 @@
 
 A tool that checks TLS certificate expiry for a list of hosts, keeps a
 history of every check in SQLite, alerts admins by email and Slack before
-certificates lapse, and shows everything on a web dashboard. The checks are
-built to run from cron.
+certificates lapse, and shows everything on a web dashboard with admin and
+viewer accounts. Admins acknowledge alerts, and unacknowledged urgent ones
+escalate. It can also search Certificate Transparency logs to find hosts
+you aren't monitoring and certificates you didn't request.
 
-Current state: **Phase 3** (CLI + SQLite history + email/Slack alerts + web
-dashboard). See the [roadmap](#roadmap) for what comes next.
+Run it with cron on a server, or with [Docker Compose](#docker-compose).
 
 ## Install
 
@@ -318,6 +319,63 @@ Then add a crontab entry with `crontab -e`:
 Frequent runs are safe because alerts are deduplicated. More runs just mean
 finer-grained history and faster detection of outages.
 
+## Docker Compose
+
+`docker-compose.yml` runs two containers from the same image. Both share a
+`data` volume that holds the database:
+
+- **`dashboard`:** the web dashboard, published on the host at
+  `127.0.0.1:8080`.
+- **`scheduler`:** runs `check` every `CHECK_INTERVAL_SECONDS` (default 6
+  hours). Once a day it also runs `discover` for `DISCOVER_DOMAINS` (if
+  set) and `prune`.
+
+Setup:
+
+```bash
+cd cert-monitor
+cp .env.example .env                  # fill in SMTP/Slack settings and DASHBOARD_SECRET_KEY
+cp targets.example.txt targets.txt    # list your hosts
+docker compose build
+docker compose run --rm dashboard python cert_monitor.py user add alice --role admin
+docker compose up -d
+```
+
+Then open <http://127.0.0.1:8080>. Other commands run inside a container
+the same way:
+
+```bash
+docker compose exec dashboard python cert_monitor.py history
+docker compose exec dashboard python cert_monitor.py ack vpn.example.com --by alice --note "OPS-123"
+docker compose exec dashboard python cert_monitor.py user add bob --role viewer
+docker compose logs -f scheduler
+```
+
+Things to know:
+
+- **Configuration:** `.env` holds your secrets, so keep it out of version
+  control (it's already in `.gitignore`). The scheduler's `CHECK_ARGS` and
+  `DISCOVER_ARGS` settings are the extra options passed to `check` and
+  `discover`, e.g. `--email --slack --escalate-after 24`.
+- **Targets file:** `targets.txt` is mounted read-only, and edits take
+  effect on the next check. Compose refuses to start if the file doesn't
+  exist. For that reason the scheduler never runs `discover --add`: run it
+  yourself and review what it appends.
+- **Hardening:** both containers run as an unprivileged user with a
+  read-only filesystem, no Linux capabilities, and `no-new-privileges`.
+  Only the `data` volume and `/tmp` are writable.
+- **Remote access:** the dashboard is published on the host's loopback
+  only. To reach it from other machines, put an HTTPS reverse proxy in front
+  of it and set `DASHBOARD_SECURE_COOKIES=1`.
+- **Backups:** everything (history, alerts, accounts, acknowledgements)
+  lives in the `data` volume. To take a consistent copy while it's
+  running:
+
+  ```bash
+  docker compose exec dashboard python -c "import sqlite3; sqlite3.connect('/data/cert_monitor.db').execute(\"VACUUM INTO '/data/backup.db'\")"
+  docker compose cp dashboard:/data/backup.db ./cert-monitor-backup.db
+  ```
+
 ## Tests
 
 ```bash
@@ -325,12 +383,19 @@ python -m unittest discover -s tests -v
 ```
 
 The tests start local TLS servers with generated certificates to cover each
-status, so they don't need internet access.
+status, and use recorded crt.sh responses for discovery, so they don't need
+internet access.
 
 ## Roadmap
 
-- ~~**Phase 1** — CLI checker with email alerts.~~
-- ~~**Phase 2** — SQLite history, deduplicated alerts, cron.~~
-- ~~**Phase 3** — Web dashboard + Slack webhook alerts.~~
-- **Phase 4** — Certificate Transparency log discovery, escalation chains,
-  RBAC, history cleanup, Docker Compose packaging.
+All four planned phases are done:
+
+1. CLI checker with email alerts
+2. SQLite history, deduplicated alerts, cron
+3. Web dashboard and Slack alerts
+4. Certificate Transparency discovery, alert acknowledgement and escalation,
+   admin/viewer accounts, history cleanup, Docker Compose packaging
+
+Possible next steps: manage targets from the dashboard instead of a file,
+check certificates on non-HTTPS services that upgrade to TLS with STARTTLS
+(SMTP, IMAP), and add PagerDuty or Microsoft Teams alert channels.

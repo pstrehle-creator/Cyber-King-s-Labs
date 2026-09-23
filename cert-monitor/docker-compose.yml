@@ -1,0 +1,46 @@
+x-cert-monitor: &cert-monitor
+  build: .
+  image: cert-monitor:local
+  env_file: .env
+  volumes:
+    - data:/data
+  init: true
+  restart: unless-stopped
+  read_only: true
+  tmpfs:
+    - /tmp
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+
+services:
+  dashboard:
+    <<: *cert-monitor
+    command: ["python", "cert_monitor.py", "serve", "--host", "0.0.0.0", "--port", "8080"]
+    # Published on the host's loopback only. Put an HTTPS reverse proxy in
+    # front of it to reach it from other machines.
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/login', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  scheduler:
+    <<: *cert-monitor
+    command: ["cert-monitor-scheduler"]
+    volumes:
+      - data:/data
+      - type: bind
+        source: ./targets.txt
+        target: /config/targets.txt
+        read_only: true
+        bind:
+          # Fail at startup if targets.txt is missing, instead of Docker
+          # silently creating an empty directory in its place.
+          create_host_path: false
+
+volumes:
+  data:

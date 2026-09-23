@@ -281,7 +281,7 @@ def send_slack(title: str, lines: list[str], url_var: str = "SLACK_WEBHOOK_URL")
 
 def send_email(title: str, lines: list[str], to_var: str = "ALERT_TO_EMAILS") -> bool:
     smtp_host = os.environ.get("SMTP_HOST")
-    smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+    smtp_port = int(os.environ.get("SMTP_PORT") or 587)
     smtp_user = os.environ.get("SMTP_USER")
     smtp_password = os.environ.get("SMTP_PASSWORD")
     from_addr = os.environ.get("ALERT_FROM_EMAIL")
@@ -702,7 +702,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Monitor TLS certificate expiry.")
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument(
-        "--db", default=DEFAULT_DB_PATH, help=f"SQLite database path (default: {DEFAULT_DB_PATH})"
+        "--db", default=os.environ.get("CERT_MONITOR_DB") or DEFAULT_DB_PATH,
+        help=f"SQLite database path (default: $CERT_MONITOR_DB, or {DEFAULT_DB_PATH})",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
