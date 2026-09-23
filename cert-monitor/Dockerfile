@@ -9,7 +9,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY cert_monitor.py ct.py dashboard.py storage.py ./
+COPY cert_monitor.py ct.py dashboard.py storage.py targets.py ./
 COPY templates/ templates/
 COPY static/ static/
 COPY docker/scheduler.sh /usr/local/bin/cert-monitor-scheduler

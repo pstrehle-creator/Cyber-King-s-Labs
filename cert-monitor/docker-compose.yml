@@ -31,16 +31,6 @@ services:
   scheduler:
     <<: *cert-monitor
     command: ["cert-monitor-scheduler"]
-    volumes:
-      - data:/data
-      - type: bind
-        source: ./targets.txt
-        target: /config/targets.txt
-        read_only: true
-        bind:
-          # Fail at startup if targets.txt is missing, instead of Docker
-          # silently creating an empty directory in its place.
-          create_host_path: false
 
 volumes:
   data:

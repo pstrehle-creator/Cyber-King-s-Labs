@@ -1,0 +1,100 @@
+{% extends "base.html" %}
+
+{% block title %}Hosts{% endblock %}
+
+{% block content %}
+<h1>Hosts</h1>
+
+{% if g.user.role == 'admin' %}
+<section class="panel">
+  <h2>Add a host</h2>
+  <form method="post" action="{{ url_for('add_host') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label for="target" class="muted">Hostname, optionally with a port (default 443)</label>
+    <div class="form-row">
+      <input id="target" name="target" required maxlength="300" placeholder="e.g. vpn.example.com or mail.example.com:993">
+      <button type="submit">Add</button>
+    </div>
+  </form>
+</section>
+{% endif %}
+
+{% set active = hosts|selectattr('active')|list %}
+{% set removed = hosts|rejectattr('active')|list %}
+
+<section>
+  <h2>Monitored ({{ active|length }})</h2>
+  {% if active %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Host</th>
+          <th>Last status</th>
+          <th class="num hide-sm">Days left</th>
+          <th class="hide-sm">Last checked</th>
+          {% if g.user.role == 'admin' %}<th><span class="visually-hidden">Actions</span></th>{% endif %}
+        </tr>
+      </thead>
+      <tbody>
+        {% for h in active %}
+        <tr>
+          <td class="target"><a href="{{ url_for('target', hostname=h.hostname, port=h.port) }}">{{ h|target_label }}</a></td>
+          <td>
+            {% if h.status %}<span class="badge status-{{ h.status|lower }}">{{ h.status|status_label }}</span>
+            {% else %}<span class="muted">Not checked yet</span>{% endif %}
+          </td>
+          <td class="num hide-sm">{{ h.days_remaining if h.days_remaining is not none else '—' }}</td>
+          <td class="nowrap hide-sm">{{ h.checked_at|fmt_time }}</td>
+          {% if g.user.role == 'admin' %}
+          <td class="row-actions">
+            <form method="post" action="{{ url_for('remove_host', target_id=h.id) }}">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+              <button type="submit" class="secondary" aria-label="Stop monitoring {{ h|target_label }}">Remove</button>
+            </form>
+          </td>
+          {% endif %}
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">No hosts are being monitored yet.</p>
+  {% endif %}
+</section>
+
+{% if removed %}
+<section>
+  <h2>Removed ({{ removed|length }})</h2>
+  <p class="muted">These aren't checked anymore. Their history is kept.</p>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Host</th>
+          <th>Removed</th>
+          {% if g.user.role == 'admin' %}<th><span class="visually-hidden">Actions</span></th>{% endif %}
+        </tr>
+      </thead>
+      <tbody>
+        {% for h in removed %}
+        <tr>
+          <td class="target"><a href="{{ url_for('target', hostname=h.hostname, port=h.port) }}">{{ h|target_label }}</a></td>
+          <td>{% if h.changed_by %}by {{ h.changed_by }}, {% endif %}{{ h.changed_at|fmt_time }}</td>
+          {% if g.user.role == 'admin' %}
+          <td class="row-actions">
+            <form method="post" action="{{ url_for('restore_host', target_id=h.id) }}">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+              <button type="submit" class="secondary" aria-label="Monitor {{ h|target_label }} again">Restore</button>
+            </form>
+          </td>
+          {% endif %}
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endif %}
+{% endblock %}

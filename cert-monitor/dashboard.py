@@ -13,6 +13,7 @@ from flask import (
     Flask,
     Response,
     abort,
+    flash,
     g,
     jsonify,
     redirect,
@@ -24,6 +25,7 @@ from flask import (
 from werkzeug.security import check_password_hash, generate_password_hash
 
 import storage
+import targets
 
 STATUS_ORDER = ["EXPIRED", "INVALID_CHAIN", "UNREACHABLE", "EXPIRING_SOON", "OK"]
 STATUS_LABELS = {
@@ -101,6 +103,7 @@ def create_app(
     app.jinja_env.filters["fmt_time"] = _fmt_time
     app.jinja_env.filters["status_label"] = lambda s: STATUS_LABELS.get(s, s)
     app.jinja_env.filters["alert_label"] = _alert_label
+    app.jinja_env.filters["target_label"] = lambda t: targets.format_target(t["hostname"], t["port"])
     stale_after = timedelta(hours=stale_hours)
 
     def db():
@@ -222,7 +225,61 @@ def create_app(
             counts=counts,
             stale=sum(r["stale"] for r in rows),
             stale_hours=stale_hours,
+            unchecked=storage.unchecked_target_count(db()),
         )
+
+    def now_iso() -> str:
+        return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    @app.get("/hosts")
+    def hosts():
+        return render_template("hosts.html", hosts=storage.targets_overview(db()))
+
+    @app.post("/hosts")
+    @require_admin
+    def add_host():
+        try:
+            hostname, port = targets.parse_target(request.form.get("target", "")[:300])
+        except ValueError as exc:
+            flash(f"Couldn't add that host: {exc}.", "error")
+            return redirect(url_for("hosts"))
+        outcome = storage.add_target(db(), hostname, port, g.user["username"], now_iso())
+        db().commit()
+        label = targets.format_target(hostname, port)
+        flash({
+            "added": f"Now monitoring {label}. It will be checked on the next scheduled run.",
+            "restored": f"Monitoring {label} again.",
+            "unchanged": f"{label} is already being monitored.",
+        }[outcome], "info")
+        return redirect(url_for("hosts"))
+
+    @app.post("/hosts/<int:target_id>/remove")
+    @require_admin
+    def remove_host(target_id):
+        target_row = storage.get_target_by_id(db(), target_id)
+        if target_row is None:
+            abort(404)
+        if storage.remove_target(db(), target_id, g.user["username"], now_iso()):
+            db().commit()
+            flash(
+                f"Stopped monitoring {targets.format_target(target_row['hostname'], target_row['port'])}. "
+                "Its history is kept, and you can restore it below.",
+                "info",
+            )
+        return redirect(url_for("hosts"))
+
+    @app.post("/hosts/<int:target_id>/restore")
+    @require_admin
+    def restore_host(target_id):
+        target_row = storage.get_target_by_id(db(), target_id)
+        if target_row is None:
+            abort(404)
+        storage.add_target(db(), target_row["hostname"], target_row["port"], g.user["username"], now_iso())
+        db().commit()
+        flash(f"Monitoring {targets.format_target(target_row['hostname'], target_row['port'])} again.", "info")
+        if request.form.get("return_to") == "target":
+            return redirect(url_for("target", hostname=target_row["hostname"], port=target_row["port"]))
+        return redirect(url_for("hosts"))
 
     @app.get("/targets/<hostname>/<int:port>")
     def target(hostname, port):

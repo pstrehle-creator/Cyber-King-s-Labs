@@ -8,6 +8,8 @@ attention: it crosses an expiry tier, expires, becomes unreachable, or fails
 chain validation. Also serves a web dashboard over the history.
 
 Usage:
+    python cert_monitor.py targets add example.com github.com:443
+    python cert_monitor.py check
     python cert_monitor.py check example.com github.com:443
     python cert_monitor.py check --targets-file targets.txt --email --slack
     python cert_monitor.py history
@@ -45,8 +47,8 @@ from cryptography import x509
 import ct
 import dashboard
 import storage
+import targets
 
-DEFAULT_PORT = 443
 DEFAULT_THRESHOLD_DAYS = 30
 DEFAULT_ALERT_TIERS = [30, 14, 7, 3, 1]
 DEFAULT_TIMEOUT = 5.0
@@ -77,27 +79,39 @@ class CertCheckResult:
 
     @property
     def target(self) -> str:
-        return f"{self.hostname}:{self.port}"
+        return targets.format_target(self.hostname, self.port)
+
+
+def target_lines(text: str) -> list[str]:
+    """Non-empty, non-comment lines of a targets file."""
+    return [line.strip() for line in text.splitlines() if line.strip() and not line.strip().startswith("#")]
 
 
 def parse_targets_file(path: Path) -> list[str]:
-    targets = []
-    for line in path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        targets.append(line)
-    return targets
+    return target_lines(path.read_text())
 
 
-def split_target(raw: str) -> tuple[str, int]:
-    if ":" in raw:
-        host, _, port_str = raw.rpartition(":")
+def parse_targets_or_report(raw_targets: list[str]) -> list[tuple[str, int]] | None:
+    """Parse every target, printing each invalid one. Returns None if any
+    were invalid, so a typo is fixed rather than silently skipped."""
+    parsed, ok = [], True
+    for raw in raw_targets:
         try:
-            return host, int(port_str)
-        except ValueError:
-            return raw, DEFAULT_PORT
-    return raw, DEFAULT_PORT
+            parsed.append(targets.parse_target(raw))
+        except ValueError as exc:
+            print(f"[error] {exc}", file=sys.stderr)
+            ok = False
+    return list(dict.fromkeys(parsed)) if ok else None
+
+
+def _actor(args: argparse.Namespace) -> str | None:
+    if args.by:
+        return args.by
+    try:
+        return getpass.getuser()
+    except (OSError, KeyError):
+        print("[error] couldn't determine your login name; pass --by NAME", file=sys.stderr)
+        return None
 
 
 def _fetch_cert_der(hostname: str, port: int, timeout: float) -> bytes:
@@ -218,13 +232,13 @@ def find_new_alerts(
 
 
 def print_table(rows: list[dict], show_time: bool = False) -> None:
-    targets = [f"{r['hostname']}:{r['port']}" for r in rows]
-    width = max([len("TARGET"), *map(len, targets)])
+    labels = [targets.format_target(r["hostname"], r["port"]) for r in rows]
+    width = max([len("TARGET"), *map(len, labels)])
     time_col = f"{'CHECKED AT':<26} " if show_time else ""
     header = f"{time_col}{'TARGET':<{width}} {'STATUS':<15} {'DAYS':>6}  {'NOT AFTER':<26} ISSUER / ERROR"
     print(header)
     print("-" * len(header))
-    for target, r in zip(targets, rows):
+    for target, r in zip(labels, rows):
         time_val = f"{r['checked_at']:<26} " if show_time else ""
         days = "?" if r["days_remaining"] is None else str(r["days_remaining"])
         detail = r["error"] if r["status"] != "OK" and r["error"] else (r["issuer"] or "-")
@@ -393,12 +407,22 @@ def cmd_check(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
     raw_targets = list(args.targets)
     if args.targets_file:
         raw_targets.extend(parse_targets_file(args.targets_file))
-    if not raw_targets:
-        args.parser.error("no targets given (pass targets as arguments or via --targets-file)")
+    if raw_targets:
+        to_check = parse_targets_or_report(raw_targets)
+        if to_check is None:
+            return 2
+    else:
+        to_check = [(t["hostname"], t["port"]) for t in storage.active_targets(conn)]
+        if not to_check:
+            print(
+                "[error] no hosts to check: add some with 'targets add HOST', "
+                "or pass hosts / --targets-file",
+                file=sys.stderr,
+            )
+            return 2
 
     checked = []
-    for raw in raw_targets:
-        hostname, port = split_target(raw)
+    for hostname, port in to_check:
         result = check_target(hostname, port, timeout=args.timeout, threshold=args.threshold)
         target_id = storage.upsert_target(conn, hostname, port)
         storage.record_check(conn, target_id, result)
@@ -450,10 +474,13 @@ def cmd_check(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
 
 def cmd_history(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
     if args.target:
-        hostname, port = split_target(args.target)
+        parsed = parse_targets_or_report([args.target])
+        if parsed is None:
+            return 2
+        hostname, port = parsed[0]
         rows = storage.target_history(conn, hostname, port, args.limit)
         if not rows:
-            print(f"no checks recorded for {hostname}:{port}")
+            print(f"no checks recorded for {targets.format_target(hostname, port)}")
             return 0
         print_table([dict(r) for r in rows], show_time=True)
     else:
@@ -512,12 +539,13 @@ def cmd_discover(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
         domains = list(dict.fromkeys(ct.normalize_domain(d) for d in args.domains))
     except ValueError as exc:
         args.parser.error(str(exc))
-    if args.add and not args.targets_file:
-        args.parser.error("--add needs --targets-file")
-
     monitored = storage.monitored_hostnames(conn)
     if args.targets_file and args.targets_file.exists():
-        monitored |= {split_target(t)[0].lower() for t in parse_targets_file(args.targets_file)}
+        for raw in parse_targets_file(args.targets_file):
+            try:
+                monitored.add(targets.parse_target(raw)[0])
+            except ValueError:
+                pass
 
     lookup_failed = False
     found_new = False
@@ -553,8 +581,15 @@ def cmd_discover(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
         }
 
     if args.add and unmonitored:
-        _append_targets(args.targets_file, sorted(unmonitored))
-        print(f"[info] added {len(unmonitored)} hostname(s) to {args.targets_file}")
+        if args.targets_file:
+            _append_targets(args.targets_file, sorted(unmonitored))
+            print(f"[info] added {len(unmonitored)} hostname(s) to {args.targets_file}")
+        else:
+            now = _utc_now_iso()
+            for name in sorted(unmonitored):
+                storage.add_target(conn, name, targets.DEFAULT_PORT, "discover", now)
+            conn.commit()
+            print(f"[info] now monitoring {len(unmonitored)} more host(s): {', '.join(sorted(unmonitored))}")
 
     for channel in (c for c in CT_NOTIFIERS if getattr(args, c)):
         rows = storage.unnotified_ct_certs(conn, domains, channel)
@@ -577,23 +612,93 @@ def cmd_discover(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
 
 
 def cmd_ack(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
-    hostname, port = split_target(args.target)
+    parsed = parse_targets_or_report([args.target])
+    if parsed is None:
+        return 2
+    hostname, port = parsed[0]
+    label = targets.format_target(hostname, port)
     target = storage.get_target(conn, hostname, port)
     active = storage.active_alert(conn, target["id"]) if target else None
     if active is None:
-        print(f"[error] {hostname}:{port} has no open alert to acknowledge", file=sys.stderr)
+        print(f"[error] {label} has no open alert to acknowledge", file=sys.stderr)
         return 2
-    by = args.by
-    if not by:
-        try:
-            by = getpass.getuser()
-        except (OSError, KeyError):
-            print("[error] couldn't determine your login name; pass --by NAME", file=sys.stderr)
-            return 2
+    by = _actor(args)
+    if by is None:
+        return 2
     key, _ = active
     storage.record_ack(conn, target["id"], key, by, args.note, _utc_now_iso())
     conn.commit()
-    print(f"[info] acknowledged {key} on {hostname}:{port} as {by}")
+    print(f"[info] acknowledged {key} on {label} as {by}")
+    return 0
+
+
+def _add_targets(conn: sqlite3.Connection, raw_targets: list[str], by: str) -> int:
+    parsed = parse_targets_or_report(raw_targets)
+    if parsed is None:
+        return 2
+    now = _utc_now_iso()
+    for hostname, port in parsed:
+        outcome = storage.add_target(conn, hostname, port, by, now)
+        label = targets.format_target(hostname, port)
+        print({
+            "added": f"[info] now monitoring {label}",
+            "restored": f"[info] monitoring {label} again",
+            "unchanged": f"[info] already monitoring {label}",
+        }[outcome])
+    conn.commit()
+    return 0
+
+
+def cmd_targets_add(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
+    by = _actor(args)
+    return 2 if by is None else _add_targets(conn, args.targets, by)
+
+
+def cmd_targets_import(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
+    by = _actor(args)
+    if by is None:
+        return 2
+    text = sys.stdin.read() if args.file == "-" else Path(args.file).read_text()
+    lines = target_lines(text)
+    if not lines:
+        print("[error] no targets found in the input", file=sys.stderr)
+        return 2
+    return _add_targets(conn, lines, by)
+
+
+def cmd_targets_remove(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
+    by = _actor(args)
+    parsed = parse_targets_or_report(args.targets)
+    if by is None or parsed is None:
+        return 2
+    code = 0
+    for hostname, port in parsed:
+        label = targets.format_target(hostname, port)
+        target = storage.get_target(conn, hostname, port)
+        if target is None or not storage.remove_target(conn, target["id"], by, _utc_now_iso()):
+            print(f"[error] {label} isn't being monitored", file=sys.stderr)
+            code = 2
+            continue
+        print(f"[info] stopped monitoring {label} (its history is kept)")
+    conn.commit()
+    return code
+
+
+def cmd_targets_list(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
+    rows = [r for r in storage.targets_overview(conn) if r["active"] or args.all]
+    if not rows:
+        print("no hosts yet; add some with: python cert_monitor.py targets add example.com")
+        return 0
+    labels = [targets.format_target(r["hostname"], r["port"]) for r in rows]
+    width = max(len("TARGET"), *map(len, labels))
+    print(f"{'TARGET':<{width}}  {'STATE':<9} {'LAST STATUS':<15} {'DAYS':>5}  LAST CHECKED")
+    for label, r in zip(labels, rows):
+        state = "active" if r["active"] else "removed"
+        days = "" if r["days_remaining"] is None else str(r["days_remaining"])
+        print(
+            f"{label:<{width}}  {state:<9} {r['status'] or 'not checked':<15} {days:>5}  "
+            f"{r['checked_at'] or '-'}"
+        )
     return 0
 
 
@@ -708,8 +813,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     check = subparsers.add_parser("check", parents=[common], help="check targets and record results")
-    check.add_argument("targets", nargs="*", help="host or host:port targets to check")
-    check.add_argument("--targets-file", type=Path, help="file with one host[:port] per line")
+    check.add_argument(
+        "targets", nargs="*",
+        help="host or host:port to check (default: every host added with 'targets add')",
+    )
+    check.add_argument("--targets-file", type=Path, help="check the hosts in this file (one per line)")
     check.add_argument(
         "--threshold", type=int, default=DEFAULT_THRESHOLD_DAYS,
         help="days remaining considered 'expiring soon' (default: 30)",
@@ -751,7 +859,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--targets-file", type=Path, help="also count hostnames in this file as monitored"
     )
     discover.add_argument(
-        "--add", action="store_true", help="append hostnames that aren't monitored yet to --targets-file"
+        "--add", action="store_true",
+        help="start monitoring hostnames that aren't yet (appended to --targets-file if given)",
     )
     discover.add_argument(
         "--timeout", type=float, default=60, help="crt.sh request timeout in seconds (default: 60)"
@@ -759,6 +868,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
     discover.add_argument("--email", action="store_true", help="email a report of newly issued certificates")
     discover.add_argument("--slack", action="store_true", help="post newly issued certificates to Slack")
     discover.set_defaults(func=cmd_discover, parser=discover)
+
+    hosts = subparsers.add_parser("targets", help="manage the hosts that 'check' monitors")
+    host_commands = hosts.add_subparsers(dest="targets_command", required=True)
+    hosts_list = host_commands.add_parser("list", parents=[common], help="list monitored hosts")
+    hosts_list.add_argument("--all", action="store_true", help="include removed hosts")
+    hosts_list.set_defaults(func=cmd_targets_list)
+    hosts_add = host_commands.add_parser("add", parents=[common], help="start monitoring hosts")
+    hosts_add.add_argument("targets", nargs="+", metavar="TARGET", help="host or host:port")
+    hosts_add.add_argument("--by", help="who is making the change (default: your login name)")
+    hosts_add.set_defaults(func=cmd_targets_add)
+    hosts_remove = host_commands.add_parser(
+        "remove", parents=[common], help="stop monitoring hosts (their history is kept)"
+    )
+    hosts_remove.add_argument("targets", nargs="+", metavar="TARGET", help="host or host:port")
+    hosts_remove.add_argument("--by", help="who is making the change (default: your login name)")
+    hosts_remove.set_defaults(func=cmd_targets_remove)
+    hosts_import = host_commands.add_parser(
+        "import", parents=[common], help="add every host in a targets file ('-' reads stdin)"
+    )
+    hosts_import.add_argument("file")
+    hosts_import.add_argument("--by", help="who is making the change (default: your login name)")
+    hosts_import.set_defaults(func=cmd_targets_import)
 
     ack = subparsers.add_parser(
         "ack", parents=[common], help="acknowledge a target's open alert so it isn't escalated"

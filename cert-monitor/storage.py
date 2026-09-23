@@ -12,6 +12,9 @@ CREATE TABLE IF NOT EXISTS targets (
     hostname TEXT NOT NULL,
     port INTEGER NOT NULL,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    active INTEGER NOT NULL DEFAULT 1,
+    changed_by TEXT,
+    changed_at TEXT,
     UNIQUE (hostname, port)
 );
 
@@ -105,6 +108,7 @@ def connect(path: str) -> sqlite3.Connection:
     conn.executescript(SCHEMA)
     _add_alerted_at_column(conn)
     _migrate_phase2_alert_state(conn)
+    _add_target_management_columns(conn)
     return conn
 
 
@@ -120,6 +124,20 @@ def _add_alerted_at_column(conn: sqlite3.Connection) -> None:
         return
     conn.execute("ALTER TABLE alert_state ADD COLUMN alerted_at TEXT")
     conn.execute("UPDATE alert_state SET alerted_at = ?", (_utc_now_iso(),))
+    conn.commit()
+
+
+def _add_target_management_columns(conn: sqlite3.Connection) -> None:
+    """Databases from before hosts could be managed in the dashboard. Every
+    existing target stays active."""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(targets)")}
+    for name, declaration in (
+        ("active", "INTEGER NOT NULL DEFAULT 1"),
+        ("changed_by", "TEXT"),
+        ("changed_at", "TEXT"),
+    ):
+        if name not in columns:
+            conn.execute(f"ALTER TABLE targets ADD COLUMN {name} {declaration}")
     conn.commit()
 
 
@@ -142,13 +160,80 @@ def _migrate_phase2_alert_state(conn: sqlite3.Connection) -> None:
 
 
 def upsert_target(conn: sqlite3.Connection, hostname: str, port: int) -> int:
+    """Get or create a target, making it active: a target someone explicitly
+    asks to check is monitored again even if it was removed earlier."""
     conn.execute(
-        "INSERT OR IGNORE INTO targets (hostname, port) VALUES (?, ?)", (hostname, port)
+        """
+        INSERT INTO targets (hostname, port) VALUES (?, ?)
+        ON CONFLICT (hostname, port) DO UPDATE SET active = 1
+        """,
+        (hostname, port),
     )
     row = conn.execute(
         "SELECT id FROM targets WHERE hostname = ? AND port = ?", (hostname, port)
     ).fetchone()
     return row["id"]
+
+
+def add_target(conn: sqlite3.Connection, hostname: str, port: int, actor: str, at: str) -> str:
+    """Start monitoring a target. Returns "added", "restored" or "unchanged"."""
+    existing = get_target(conn, hostname, port)
+    if existing is not None and existing["active"]:
+        return "unchanged"
+    conn.execute(
+        """
+        INSERT INTO targets (hostname, port, active, changed_by, changed_at) VALUES (?, ?, 1, ?, ?)
+        ON CONFLICT (hostname, port) DO UPDATE SET
+            active = 1, changed_by = excluded.changed_by, changed_at = excluded.changed_at
+        """,
+        (hostname, port, actor, at),
+    )
+    return "added" if existing is None else "restored"
+
+
+def remove_target(conn: sqlite3.Connection, target_id: int, actor: str, at: str) -> bool:
+    """Stop monitoring a target, keeping its history. Returns False if it
+    wasn't being monitored."""
+    cursor = conn.execute(
+        "UPDATE targets SET active = 0, changed_by = ?, changed_at = ? WHERE id = ? AND active = 1",
+        (actor, at, target_id),
+    )
+    if not cursor.rowcount:
+        return False
+    # A removed host shouldn't show an open alert or be escalated.
+    clear_alert_state(conn, target_id)
+    return True
+
+
+def get_target_by_id(conn: sqlite3.Connection, target_id: int) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM targets WHERE id = ?", (target_id,)).fetchone()
+
+
+def active_targets(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM targets WHERE active = 1 ORDER BY hostname, port"
+    ).fetchall()
+
+
+def targets_overview(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Every target, active first, with its latest check (if any)."""
+    return conn.execute(
+        """
+        SELECT t.*, c.status, c.checked_at, c.days_remaining
+        FROM targets t
+        LEFT JOIN checks c ON c.id = (SELECT MAX(id) FROM checks WHERE target_id = t.id)
+        ORDER BY t.active DESC, t.hostname, t.port
+        """
+    ).fetchall()
+
+
+def unchecked_target_count(conn: sqlite3.Connection) -> int:
+    return conn.execute(
+        """
+        SELECT COUNT(*) FROM targets t
+        WHERE t.active = 1 AND NOT EXISTS (SELECT 1 FROM checks WHERE target_id = t.id)
+        """
+    ).fetchone()[0]
 
 
 def get_target(conn: sqlite3.Connection, hostname: str, port: int) -> sqlite3.Row | None:
@@ -259,7 +344,8 @@ def latest_checks(conn: sqlite3.Connection) -> list[sqlite3.Row]:
         SELECT t.hostname, t.port, c.*
         FROM checks c
         JOIN targets t ON t.id = c.target_id
-        WHERE c.id = (SELECT MAX(id) FROM checks WHERE target_id = c.target_id)
+        WHERE t.active = 1
+          AND c.id = (SELECT MAX(id) FROM checks WHERE target_id = c.target_id)
         ORDER BY c.days_remaining IS NULL, c.days_remaining
         """
     ).fetchall()
@@ -333,7 +419,7 @@ def target_alerts(conn: sqlite3.Connection, target_id: int, limit: int) -> list[
 
 
 def monitored_hostnames(conn: sqlite3.Connection) -> set[str]:
-    return {row["hostname"].lower() for row in conn.execute("SELECT hostname FROM targets")}
+    return {row["hostname"].lower() for row in conn.execute("SELECT hostname FROM targets WHERE active = 1")}
 
 
 def ct_domain(conn: sqlite3.Connection, domain: str) -> sqlite3.Row | None:

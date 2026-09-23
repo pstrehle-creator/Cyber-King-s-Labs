@@ -1,10 +1,26 @@
 {% extends "base.html" %}
 
-{% block title %}{{ target.hostname }}:{{ target.port }}{% endblock %}
+{% block title %}{{ target|target_label }}{% endblock %}
 
 {% block content %}
-<p class="back"><a href="{{ url_for('index') }}">← All targets</a></p>
-<h1>{{ target.hostname }}:{{ target.port }}</h1>
+<p class="back"><a href="{{ url_for('index') }}">← Status</a></p>
+<h1>{{ target|target_label }}</h1>
+
+{% if not target.active %}
+<div class="flash flash-error removed-banner">
+  <span>
+    No longer monitored{% if target.changed_by %}: removed by {{ target.changed_by }} on {{ target.changed_at|fmt_time }}{% endif %}.
+    The history below is kept.
+  </span>
+  {% if g.user.role == 'admin' %}
+  <form method="post" action="{{ url_for('restore_host', target_id=target.id) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="return_to" value="target">
+    <button type="submit">Restore</button>
+  </form>
+  {% endif %}
+</div>
+{% endif %}
 
 {% if latest %}
 <section class="panel">
@@ -45,7 +61,7 @@
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <input type="hidden" name="alert_key" value="{{ alert.key }}">
     <label for="note">Note (optional)</label>
-    <div class="ack-row">
+    <div class="form-row">
       <input id="note" name="note" maxlength="500" placeholder="e.g. renewal ticket OPS-123">
       <button type="submit">Acknowledge</button>
     </div>

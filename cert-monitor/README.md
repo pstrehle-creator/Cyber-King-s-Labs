@@ -19,27 +19,55 @@ pip install -r requirements.txt
 
 ## Usage
 
+### Choose which hosts to monitor
+
+The hosts to monitor are kept in the database. Add them from the command
+line, or from the dashboard's **Hosts** page:
+
+```bash
+python cert_monitor.py targets add example.com vpn.example.com mail.example.com:993
+python cert_monitor.py targets import targets.example.txt   # one host[:port] per line; '-' reads stdin
+python cert_monitor.py targets list                         # add --all to include removed hosts
+python cert_monitor.py targets remove vpn.example.com
+```
+
+A host is `hostname` or `hostname:port` (the default port is 443).
+Internal names like `intranet` and IP addresses work. Write IPv6
+addresses in brackets, like `[2001:db8::1]:443`. Removing a host stops
+checks and alerts for it, but keeps its history. Adding it again restores
+it. Each add and remove records who made it (`--by`, defaulting to your
+login name).
+
 ### Check certificates
 
 ```bash
-# check specific hosts (default port 443)
-python cert_monitor.py check example.com github.com:8443
-
-# check a list of targets from a file
-python cert_monitor.py check --targets-file targets.example.txt
+# check every monitored host
+python cert_monitor.py check
 
 # treat anything within 14 days as "expiring soon" instead of the default 30
-python cert_monitor.py check --targets-file targets.example.txt --threshold 14
+python cert_monitor.py check --threshold 14
 
 # email admins about anything that newly needs attention
-python cert_monitor.py check --targets-file targets.example.txt --email
+python cert_monitor.py check --email
 
 # dump full results (issuer, SANs, chain validity, etc.) to JSON
-python cert_monitor.py check --targets-file targets.example.txt --json-out results.json
+python cert_monitor.py check --json-out results.json
+
+# check specific hosts, or the hosts in a file, instead of the monitored list
+python cert_monitor.py check example.com github.com:8443
+python cert_monitor.py check --targets-file targets.example.txt
 ```
 
+Hosts named on the command line or in `--targets-file` are also added to
+the monitored list. If you keep your list in a file and run
+`check --targets-file` from cron, that file stays in charge: a host you
+remove in the dashboard comes back on the next run if it's still in the
+file. `check` refuses to run if any host is invalid (for example
+`example.com:https`), so a typo is caught rather than skipped.
+
 Every check is recorded in `cert_monitor.db` in the current directory. Use
-`--db /path/to/file.db` to put it somewhere else.
+`--db /path/to/file.db` (or set `CERT_MONITOR_DB`) to put it somewhere
+else.
 
 Each target gets one of these statuses:
 
@@ -92,6 +120,9 @@ that `check` runs record. It doesn't run checks itself.
 
 - **Status page:** counts for each status, and every target's latest
   result with problems listed first. It reloads every 5 minutes.
+- **Hosts page:** every monitored host with its last status. Admins can
+  add hosts, and remove or restore them. A removed host's page says who
+  removed it and when.
 - **Target page:** click a target to see its certificate details (subject,
   issuer, SANs, serial, validity dates, chain trust), its last 50 checks, and
   the alerts sent for it. When the serial number changes in the history, the
@@ -112,7 +143,7 @@ There are two roles:
 | Role     | Can do                                                   |
 |----------|----------------------------------------------------------|
 | `viewer` | See everything on the dashboard and use the JSON API     |
-| `admin`  | Everything a viewer can, plus acknowledge alerts         |
+| `admin`  | Everything a viewer can, plus acknowledge alerts and add or remove hosts |
 
 Manage accounts from the command line on the server:
 
@@ -251,7 +282,7 @@ Transparency (CT) logs. `discover` searches those logs through
 [crt.sh](https://crt.sh) for your domains and their subdomains:
 
 ```bash
-python cert_monitor.py discover example.com example.org --targets-file targets.txt
+python cert_monitor.py discover example.com example.org
 ```
 
 ```
@@ -266,11 +297,12 @@ www.example.com    monitored      2026-11-20T23:59:59+00:00  C=US, O=Let's Encry
 It helps in two ways:
 
 - **Finding hosts you forgot to monitor.** Any hostname with a certificate
-  that isn't in your targets file (or already checked) shows as
-  `NOT MONITORED`. Add `--add` to append those hostnames to
-  `--targets-file`. Wildcard names like `*.example.com` can't be checked
-  directly, so they're only listed. Review what `--add` wrote, since not
-  every hostname with a certificate serves HTTPS on port 443.
+  that you aren't monitoring shows as `NOT MONITORED`. Add `--add` to
+  start monitoring those hostnames on port 443. If you keep your hosts in a
+  file, pass `--targets-file` and `--add` appends them to that file
+  instead. Wildcard names like `*.example.com` can't be checked directly,
+  so they're only listed. Review what `--add` added, since not every
+  hostname with a certificate serves HTTPS on port 443.
 - **Spotting certificates you didn't request.** The first run for a domain
   records every current certificate as a baseline. Each later run reports
   certificates issued since the previous run. If one appears that nobody
@@ -309,9 +341,9 @@ Then add a crontab entry with `crontab -e`:
 
 ```cron
 # every 6 hours; alerts are only sent when something changes
-0 */6 * * * . $HOME/.cert-monitor.env && cd /path/to/cert-monitor && ./venv/bin/python cert_monitor.py check --targets-file targets.txt --email --slack --escalate-after 24 >> cert_monitor.log 2>&1
+0 */6 * * * . $HOME/.cert-monitor.env && cd /path/to/cert-monitor && ./venv/bin/python cert_monitor.py check --email --slack --escalate-after 24 >> cert_monitor.log 2>&1
 # daily at 6am, look for new certificates issued for your domains
-0 6 * * * . $HOME/.cert-monitor.env && cd /path/to/cert-monitor && ./venv/bin/python cert_monitor.py discover example.com --targets-file targets.txt --email --slack >> cert_monitor.log 2>&1
+0 6 * * * . $HOME/.cert-monitor.env && cd /path/to/cert-monitor && ./venv/bin/python cert_monitor.py discover example.com --email --slack >> cert_monitor.log 2>&1
 # weekly on Sunday at 3am, trim history older than 90 days
 0 3 * * 0 cd /path/to/cert-monitor && ./venv/bin/python cert_monitor.py prune --keep-days 90 >> cert_monitor.log 2>&1
 ```
@@ -326,19 +358,24 @@ finer-grained history and faster detection of outages.
 
 - **`dashboard`:** the web dashboard, published on the host at
   `127.0.0.1:8080`.
-- **`scheduler`:** runs `check` every `CHECK_INTERVAL_SECONDS` (default 6
-  hours). Once a day it also runs `discover` for `DISCOVER_DOMAINS` (if
-  set) and `prune`.
+- **`scheduler`:** runs `check` on every monitored host every
+  `CHECK_INTERVAL_SECONDS` (default 6 hours). Once a day it also runs
+  `discover` for `DISCOVER_DOMAINS` (if set) and `prune`.
 
 Setup:
 
 ```bash
 cd cert-monitor
-cp .env.example .env                  # fill in SMTP/Slack settings and DASHBOARD_SECRET_KEY
-cp targets.example.txt targets.txt    # list your hosts
+cp .env.example .env    # fill in SMTP/Slack settings and DASHBOARD_SECRET_KEY
 docker compose build
 docker compose run --rm dashboard python cert_monitor.py user add alice --role admin
 docker compose up -d
+```
+
+Then add hosts on the dashboard's Hosts page, or import a list:
+
+```bash
+docker compose exec -T dashboard python cert_monitor.py targets import - --by alice < my-hosts.txt
 ```
 
 Then open <http://127.0.0.1:8080>. Other commands run inside a container
@@ -357,10 +394,9 @@ Things to know:
   control (it's already in `.gitignore`). The scheduler's `CHECK_ARGS` and
   `DISCOVER_ARGS` settings are the extra options passed to `check` and
   `discover`, e.g. `--email --slack --escalate-after 24`.
-- **Targets file:** `targets.txt` is mounted read-only, and edits take
-  effect on the next check. Compose refuses to start if the file doesn't
-  exist. For that reason the scheduler never runs `discover --add`: run it
-  yourself and review what it appends.
+- **Hosts:** the scheduler checks the hosts in the database, so changes
+  on the Hosts page take effect on the next run. It never runs
+  `discover --add`. Run that yourself and review what it adds.
 - **Hardening:** both containers run as an unprivileged user with a
   read-only filesystem, no Linux capabilities, and `no-new-privileges`.
   Only the `data` volume and `/tmp` are writable.
@@ -396,6 +432,7 @@ All four planned phases are done:
 4. Certificate Transparency discovery, alert acknowledgement and escalation,
    admin/viewer accounts, history cleanup, Docker Compose packaging
 
-Possible next steps: manage targets from the dashboard instead of a file,
-check certificates on non-HTTPS services that upgrade to TLS with STARTTLS
-(SMTP, IMAP), and add PagerDuty or Microsoft Teams alert channels.
+Since then, hosts are managed in the database and on the dashboard.
+Possible next steps: check certificates on non-HTTPS services that upgrade
+to TLS with STARTTLS (SMTP, IMAP), and add PagerDuty or Microsoft Teams
+alert channels.

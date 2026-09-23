@@ -200,9 +200,22 @@ class DiscoverCommandTests(unittest.TestCase):
         self.assertTrue(lines[3].startswith("# added by 'discover'"))
         self.assertEqual(lines[4:], ["mail.example.com"])
 
-    def test_add_requires_targets_file(self):
-        with self.assertRaises(SystemExit):
-            self._run(_fake(), "--add")
+    def test_add_without_targets_file_monitors_in_database(self):
+        conn = storage.connect(self.db_path)
+        storage.add_target(conn, "www.example.com", 443, "alice", "2026-01-01T00:00:00+00:00")
+        conn.commit()
+        conn.close()
+
+        code, out = self._run(_fake(), "--add")
+        self.assertEqual(code, 0)
+        conn = storage.connect(self.db_path)
+        try:
+            hosts = sorted(t["hostname"] for t in storage.active_targets(conn))
+            added = storage.get_target(conn, "mail.example.com", 443)
+        finally:
+            conn.close()
+        self.assertEqual(hosts, ["example.com", "mail.example.com", "www.example.com"])
+        self.assertEqual(added["changed_by"], "discover")
 
     def test_failed_lookup_records_nothing(self):
         code, out = self._run(_fake(subdomains=urllib.error.URLError("timed out")))

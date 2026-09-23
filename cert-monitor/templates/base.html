@@ -9,10 +9,16 @@
 </head>
 <body>
   <header class="site-header">
-    <a class="brand" href="{{ url_for('index') }}">cert-monitor</a>
+    <nav class="nav">
+      <a class="brand" href="{{ url_for('index') }}">cert-monitor</a>
+      {% if g.user %}
+      <a href="{{ url_for('index') }}">Status</a>
+      <a href="{{ url_for('hosts') }}">Hosts</a>
+      {% endif %}
+    </nav>
     {% if g.user %}
     <div class="account">
-      <span>{{ g.user.username }} <span class="role">{{ g.user.role }}</span></span>
+      <span class="hide-sm">{{ g.user.username }} <span class="role">{{ g.user.role }}</span></span>
       <form method="post" action="{{ url_for('logout') }}">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <button type="submit" class="link-button">Sign out</button>
@@ -21,6 +27,9 @@
     {% endif %}
   </header>
   <main>
+    {% for category, message in get_flashed_messages(with_categories=true) %}
+    <p class="flash flash-{{ category }}" role="status">{{ message }}</p>
+    {% endfor %}
     {% block content %}{% endblock %}
   </main>
 </body>
