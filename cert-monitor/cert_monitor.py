@@ -12,6 +12,7 @@ Usage:
     python cert_monitor.py check --targets-file targets.txt --email --slack
     python cert_monitor.py history
     python cert_monitor.py history example.com --limit 10
+    python cert_monitor.py ack example.com --note 'renewing today'
     python cert_monitor.py prune --keep-days 90
     python cert_monitor.py user add alice --role admin
     python cert_monitor.py serve
@@ -20,6 +21,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import functools
 import getpass
 import json
 import os
@@ -248,16 +250,24 @@ def _slack_escape(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def send_alert_slack(alerts: list[tuple[CertCheckResult, str]]) -> bool:
-    url = os.environ.get("SLACK_WEBHOOK_URL")
+def _default_title(alerts: list) -> str:
+    return f"{len(alerts)} certificate(s) need attention"
+
+
+def send_alert_slack(
+    alerts: list[tuple[CertCheckResult, str]],
+    url_var: str = "SLACK_WEBHOOK_URL",
+    title: str | None = None,
+) -> bool:
+    url = os.environ.get(url_var)
     if not url:
-        print("[warn] skipping Slack alert, missing env var: SLACK_WEBHOOK_URL", file=sys.stderr)
+        print(f"[warn] skipping Slack alert, missing env var: {url_var}", file=sys.stderr)
         return False
     if not url.startswith("https://"):
-        print("[warn] skipping Slack alert, SLACK_WEBHOOK_URL must be an https:// URL", file=sys.stderr)
+        print(f"[warn] skipping Slack alert, {url_var} must be an https:// URL", file=sys.stderr)
         return False
 
-    text = f"*cert-monitor: {len(alerts)} certificate(s) need attention*\n" + _slack_escape(
+    text = f"*cert-monitor: {title or _default_title(alerts)}*\n" + _slack_escape(
         "\n".join(format_alert_lines(alerts))
     )
     request = urllib.request.Request(
@@ -277,20 +287,24 @@ def send_alert_slack(alerts: list[tuple[CertCheckResult, str]]) -> bool:
     return True
 
 
-def send_alert_email(alerts: list[tuple[CertCheckResult, str]]) -> bool:
+def send_alert_email(
+    alerts: list[tuple[CertCheckResult, str]],
+    to_var: str = "ALERT_TO_EMAILS",
+    title: str | None = None,
+) -> bool:
     smtp_host = os.environ.get("SMTP_HOST")
     smtp_port = int(os.environ.get("SMTP_PORT", "587"))
     smtp_user = os.environ.get("SMTP_USER")
     smtp_password = os.environ.get("SMTP_PASSWORD")
     from_addr = os.environ.get("ALERT_FROM_EMAIL")
-    to_addrs = [a.strip() for a in os.environ.get("ALERT_TO_EMAILS", "").split(",") if a.strip()]
+    to_addrs = [a.strip() for a in os.environ.get(to_var, "").split(",") if a.strip()]
 
     missing = [
         name
         for name, val in [
             ("SMTP_HOST", smtp_host),
             ("ALERT_FROM_EMAIL", from_addr),
-            ("ALERT_TO_EMAILS", to_addrs),
+            (to_var, to_addrs),
         ]
         if not val
     ]
@@ -298,10 +312,11 @@ def send_alert_email(alerts: list[tuple[CertCheckResult, str]]) -> bool:
         print(f"[warn] skipping email alert, missing env vars: {', '.join(missing)}", file=sys.stderr)
         return False
 
-    body = "The following certificates need attention:\n\n" + "\n".join(format_alert_lines(alerts))
+    title = title or _default_title(alerts)
+    body = f"{title}:\n\n" + "\n".join(format_alert_lines(alerts))
 
     msg = EmailMessage()
-    msg["Subject"] = f"[cert-monitor] {len(alerts)} certificate(s) need attention"
+    msg["Subject"] = f"[cert-monitor] {title}"
     msg["From"] = from_addr
     msg["To"] = ", ".join(to_addrs)
     msg.set_content(body)
@@ -321,6 +336,52 @@ def send_alert_email(alerts: list[tuple[CertCheckResult, str]]) -> bool:
 
 
 NOTIFIERS = {"email": send_alert_email, "slack": send_alert_slack}
+ESCALATION_SUFFIX = ":escalation"
+ESCALATION_NOTIFIERS = {
+    "email": functools.partial(send_alert_email, to_var="ESCALATION_EMAILS"),
+    "slack": functools.partial(send_alert_slack, url_var="ESCALATION_SLACK_WEBHOOK_URL"),
+}
+
+
+def is_urgent(key: str, within_days: int) -> bool:
+    """Whether an unacknowledged alert is worth escalating: anything broken,
+    or an expiry tier at or under `within_days`."""
+    if key.startswith("EXPIRING_SOON"):
+        tier = key.partition(":")[2]
+        return tier.isdigit() and int(tier) <= within_days
+    return True
+
+
+def find_escalations(
+    conn: sqlite3.Connection,
+    checked: list[tuple[int, CertCheckResult]],
+    tiers: list[int],
+    channels: list[str],
+    after_hours: float,
+    within_days: int,
+    now: datetime | None = None,
+) -> dict[str, list[tuple[int, CertCheckResult, str]]]:
+    """Per base channel, urgent alerts that were sent at least `after_hours`
+    ago and haven't been acknowledged or escalated yet."""
+    now = now or datetime.now(timezone.utc)
+    escalations = {channel: [] for channel in channels}
+    for target_id, result in checked:
+        key = alert_key(result, tiers)
+        if key is None or not is_urgent(key, within_days):
+            continue
+        active = storage.active_alert(conn, target_id)
+        if active is None or active[0] != key:
+            continue
+        since = active[1]
+        if now - datetime.fromisoformat(since) < timedelta(hours=after_hours):
+            continue
+        if storage.current_ack(conn, target_id, key, since) is not None:
+            continue
+        state = storage.get_alert_state(conn, target_id)
+        for channel in channels:
+            if state.get(channel + ESCALATION_SUFFIX) != key:
+                escalations[channel].append((target_id, result, key))
+    return escalations
 
 
 def cmd_check(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
@@ -358,6 +419,23 @@ def cmd_check(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
                 storage.record_alert(conn, target_id, key, channel, sent_at)
             conn.commit()
 
+    if args.escalate_after is not None:
+        escalations = find_escalations(
+            conn, checked, args.alert_tiers, channels, args.escalate_after, args.escalate_within_days
+        )
+        for channel, alerts in escalations.items():
+            if not alerts:
+                continue
+            title = (
+                f"ESCALATION: {len(alerts)} alert(s) not acknowledged "
+                f"after {args.escalate_after:g} hours"
+            )
+            if ESCALATION_NOTIFIERS[channel]([(r, key) for _, r, key in alerts], title=title):
+                sent_at = _utc_now_iso()
+                for target_id, _, key in alerts:
+                    storage.record_alert(conn, target_id, key, channel + ESCALATION_SUFFIX, sent_at)
+                conn.commit()
+
     if any(r.status in FAILURE_STATUSES for r in results):
         return 2
     if any(r.status == "EXPIRING_SOON" for r in results):
@@ -379,6 +457,27 @@ def cmd_history(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
             print("no checks recorded yet; run the 'check' command first")
             return 0
         print_table([dict(r) for r in rows], show_time=True)
+    return 0
+
+
+def cmd_ack(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
+    hostname, port = split_target(args.target)
+    target = storage.get_target(conn, hostname, port)
+    active = storage.active_alert(conn, target["id"]) if target else None
+    if active is None:
+        print(f"[error] {hostname}:{port} has no open alert to acknowledge", file=sys.stderr)
+        return 2
+    by = args.by
+    if not by:
+        try:
+            by = getpass.getuser()
+        except (OSError, KeyError):
+            print("[error] couldn't determine your login name; pass --by NAME", file=sys.stderr)
+            return 2
+    key, _ = active
+    storage.record_ack(conn, target["id"], key, by, args.note, _utc_now_iso())
+    conn.commit()
+    print(f"[info] acknowledged {key} on {hostname}:{port} as {by}")
     return 0
 
 
@@ -508,6 +607,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     check.add_argument("--email", action="store_true", help="email admins about new alerts")
     check.add_argument("--slack", action="store_true", help="post new alerts to a Slack webhook")
+    check.add_argument(
+        "--escalate-after", type=float, metavar="HOURS",
+        help="escalate urgent alerts nobody has acknowledged after this many hours (off by default)",
+    )
+    check.add_argument(
+        "--escalate-within-days", type=int, default=7, metavar="DAYS",
+        help="expiry alerts count as urgent at this many days left or fewer (default: 7)",
+    )
     check.add_argument("--json-out", type=Path, help="write full results as JSON to this path")
     check.set_defaults(func=cmd_check, parser=check)
 
@@ -517,6 +624,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     history.add_argument("target", nargs="?", help="host or host:port to show history for")
     history.add_argument("--limit", type=int, default=20, help="max rows for one target (default: 20)")
     history.set_defaults(func=cmd_history)
+
+    ack = subparsers.add_parser(
+        "ack", parents=[common], help="acknowledge a target's open alert so it isn't escalated"
+    )
+    ack.add_argument("target", help="host or host:port")
+    ack.add_argument("--by", help="who is handling it (default: your login name)")
+    ack.add_argument("--note", help="optional note, e.g. a ticket number")
+    ack.set_defaults(func=cmd_ack)
 
     prune = subparsers.add_parser(
         "prune", parents=[common], help="delete old check history (each target's latest check is kept)"

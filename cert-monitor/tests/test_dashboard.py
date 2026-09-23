@@ -111,7 +111,7 @@ class DashboardPageTests(DashboardTestCase):
     def test_target_page_shows_history_and_alerts(self):
         html = self.client.get("/targets/soon.example/443").get_data(as_text=True)
         self.assertIn("bb02", html)
-        self.assertIn("EXPIRING_SOON:7", html)
+        self.assertIn("7-day expiry warning", html)
         self.assertIn("slack", html)
 
     def test_unknown_target_is_404(self):
@@ -221,6 +221,61 @@ class AuthenticationTests(DashboardTestCase):
         # pages only accept the session cookie.
         response = self.client.get("/", headers=_basic("alice", PASSWORD))
         self.assertEqual(response.status_code, 302)
+
+
+class AcknowledgeTests(DashboardTestCase):
+    def setUp(self):
+        super().setUp()
+        conn = storage.connect(self.db_path)
+        self.target_id = storage.get_target(conn, "soon.example", 443)["id"]
+        conn.close()
+
+    def _page(self, user):
+        _sign_in_as(self.client, user)
+        return self.client.get("/targets/soon.example/443").get_data(as_text=True)
+
+    def _ack(self, html, alert_key="EXPIRING_SOON:7", note="OPS-42"):
+        return self.client.post(
+            "/targets/soon.example/443/ack",
+            data={"csrf_token": _csrf_from(html), "alert_key": alert_key, "note": note},
+        )
+
+    def test_admin_can_acknowledge(self):
+        html = self._page("alice")
+        self.assertIn("Open alert", html)
+        self.assertIn(">Acknowledge</button>", html)
+        response = self._ack(html)
+        self.assertEqual(response.status_code, 302)
+        html = self.client.get("/targets/soon.example/443").get_data(as_text=True)
+        self.assertIn("Acknowledged</span>", html)
+        self.assertIn("OPS-42", html)
+        self.assertNotIn(">Acknowledge</button>", html)
+        by_host = {r["hostname"]: r for r in self.client.get("/api/status").get_json()}
+        self.assertEqual(by_host["soon.example"]["alert"]["ack"]["acked_by"], "alice")
+        self.assertIsNone(by_host["good.example"]["alert"])
+
+    def test_viewer_cannot_acknowledge(self):
+        html = self._page("victor")
+        self.assertIn("Open alert", html)
+        self.assertNotIn(">Acknowledge</button>", html)
+        self.assertEqual(self._ack(html).status_code, 403)
+
+    def test_stale_form_is_rejected(self):
+        html = self._page("alice")
+        self.assertEqual(self._ack(html, alert_key="EXPIRING_SOON:14").status_code, 409)
+
+    def test_requires_csrf_token(self):
+        self._page("alice")
+        response = self.client.post(
+            "/targets/soon.example/443/ack", data={"alert_key": "EXPIRING_SOON:7"}
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_note_is_escaped(self):
+        html = self._page("alice")
+        self._ack(html, note="<img src=x onerror=alert(1)>")
+        html = self.client.get("/targets/soon.example/443").get_data(as_text=True)
+        self.assertNotIn("<img src=x", html)
 
 
 class ServeCommandTests(unittest.TestCase):

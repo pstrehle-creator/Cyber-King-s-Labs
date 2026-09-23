@@ -42,6 +42,7 @@
         <td class="target"><a href="{{ url_for('target', hostname=r.hostname, port=r.port) }}">{{ r.hostname }}:{{ r.port }}</a></td>
         <td>
           <span class="badge status-{{ r.status|lower }}">{{ r.status|status_label }}</span>
+          {% if r.alert and r.alert.ack %}<span class="badge acked hide-sm">acknowledged</span>{% endif %}
           {% if r.stale %}<span class="badge stale show-sm">stale</span>{% endif %}
         </td>
         <td class="num">{{ r.days_remaining if r.days_remaining is not none else '—' }}</td>

@@ -167,6 +167,13 @@ tbody tr:last-child td { border-bottom: none; }
 .status-unreachable { background: var(--unreach-bg); color: var(--unreach-fg); }
 .stale { background: var(--stale-bg); color: var(--stale-fg); }
 .badge.show-sm { display: none; }
+.acked { background: var(--ok-bg); color: var(--ok-fg); }
+.muted { color: var(--muted); }
+.ack-form { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
+.ack-form label { color: var(--muted); font-size: 0.9rem; }
+.ack-row { display: flex; gap: 8px; }
+.ack-row input { flex: 1; min-width: 0; }
+.ack-form .muted { margin: 4px 0 0; font-size: 0.9rem; }
 .card[class*="status-"] { border-color: transparent; }
 
 .panel {
@@ -175,6 +182,7 @@ tbody tr:last-child td { border-bottom: none; }
   border-radius: 8px;
   padding: 4px 20px 16px;
 }
+.panel + .panel { margin-top: 16px; }
 .facts { display: grid; grid-template-columns: max-content 1fr; gap: 6px 20px; margin: 0; }
 .facts dt { color: var(--muted); }
 .facts dd { margin: 0; word-break: break-word; }
@@ -185,6 +193,7 @@ tbody tr:last-child td { border-bottom: none; }
   .facts dd { margin-bottom: 8px; }
   .hide-sm { display: none; }
   .badge.show-sm { display: inline-block; }
+  .ack-row { flex-direction: column; }
   .target { overflow-wrap: anywhere; }
   .nowrap { white-space: normal; }
   th, td { padding: 10px; }

@@ -278,6 +278,155 @@ class Phase2MigrationTests(unittest.TestCase):
             conn.close()
 
 
+class EscalationTests(unittest.TestCase):
+    def setUp(self):
+        self.conn = storage.connect(":memory:")
+        self.target_id = storage.upsert_target(self.conn, "example.com", 443)
+        self.t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    def tearDown(self):
+        self.conn.close()
+
+    def _at(self, hours):
+        return (self.t0 + timedelta(hours=hours)).isoformat(timespec="seconds")
+
+    def _alert(self, key, hours, channel="email"):
+        storage.record_alert(self.conn, self.target_id, key, channel, self._at(hours))
+
+    def _due(self, status, days, hours, channels=("email",), after=24, within=7):
+        result = CertCheckResult(hostname="example.com", port=443, status=status, days_remaining=days)
+        escalations = cert_monitor.find_escalations(
+            self.conn, [(self.target_id, result)], TIERS, list(channels), after, within,
+            now=self.t0 + timedelta(hours=hours),
+        )
+        return {channel: [key for _, _, key in alerts] for channel, alerts in escalations.items()}
+
+    def test_urgency(self):
+        self.assertTrue(cert_monitor.is_urgent("EXPIRED", 7))
+        self.assertTrue(cert_monitor.is_urgent("UNREACHABLE", 7))
+        self.assertTrue(cert_monitor.is_urgent("EXPIRING_SOON:7", 7))
+        self.assertTrue(cert_monitor.is_urgent("EXPIRING_SOON:1", 7))
+        self.assertFalse(cert_monitor.is_urgent("EXPIRING_SOON:14", 7))
+        self.assertFalse(cert_monitor.is_urgent("EXPIRING_SOON", 7))
+
+    def test_escalates_only_after_the_wait(self):
+        self._alert("EXPIRED", hours=0)
+        self.assertEqual(self._due("EXPIRED", -1, hours=23), {"email": []})
+        self.assertEqual(self._due("EXPIRED", -1, hours=24), {"email": ["EXPIRED"]})
+
+    def test_escalates_once_per_channel(self):
+        self._alert("EXPIRED", hours=0)
+        self._alert("EXPIRED", hours=0, channel="slack")
+        self._alert("EXPIRED", hours=30, channel="email:escalation")
+        self.assertEqual(
+            self._due("EXPIRED", -1, hours=31, channels=("email", "slack")),
+            {"email": [], "slack": ["EXPIRED"]},
+        )
+
+    def test_acknowledged_alert_is_not_escalated(self):
+        self._alert("UNREACHABLE", hours=0)
+        storage.record_ack(self.conn, self.target_id, "UNREACHABLE", "alice", None, self._at(2))
+        self.assertEqual(self._due("UNREACHABLE", None, hours=48), {"email": []})
+
+    def test_ack_from_an_earlier_occurrence_does_not_count(self):
+        self._alert("UNREACHABLE", hours=0)
+        storage.record_ack(self.conn, self.target_id, "UNREACHABLE", "alice", None, self._at(1))
+        storage.clear_alert_state(self.conn, self.target_id)  # recovered
+        self._alert("UNREACHABLE", hours=100)  # broke again
+        self.assertEqual(self._due("UNREACHABLE", None, hours=130), {"email": ["UNREACHABLE"]})
+
+    def test_ack_of_an_earlier_tier_does_not_cover_a_new_tier(self):
+        self._alert("EXPIRING_SOON:7", hours=0)
+        storage.record_ack(self.conn, self.target_id, "EXPIRING_SOON:7", "alice", None, self._at(1))
+        self._alert("EXPIRING_SOON:3", hours=96)
+        self.assertEqual(self._due("EXPIRING_SOON", 3, hours=120), {"email": ["EXPIRING_SOON:3"]})
+
+    def test_non_urgent_tiers_are_not_escalated(self):
+        self._alert("EXPIRING_SOON:14", hours=0)
+        self.assertEqual(self._due("EXPIRING_SOON", 12, hours=200), {"email": []})
+
+    def test_nothing_to_escalate_until_the_alert_was_sent(self):
+        self.assertEqual(self._due("EXPIRED", -1, hours=100), {"email": []})
+
+    def test_check_command_sends_escalations_to_escalation_contacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "esc.db")
+            conn = storage.connect(db_path)
+            target_id = storage.upsert_target(conn, "127.0.0.1", 1)
+            long_ago = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat(timespec="seconds")
+            storage.record_alert(conn, target_id, "UNREACHABLE", "email", long_ago)
+            conn.commit()
+            conn.close()
+
+            sent = []
+            env = {
+                "SMTP_HOST": "smtp.test", "ALERT_FROM_EMAIL": "monitor@x.test",
+                "ALERT_TO_EMAILS": "oncall@x.test", "ESCALATION_EMAILS": "manager@x.test",
+            }
+            with mock.patch.dict("os.environ", env), \
+                    mock.patch("cert_monitor.smtplib.SMTP") as smtp, mock.patch("sys.stdout"):
+                smtp.return_value.__enter__.return_value.send_message.side_effect = sent.append
+                argv = ["check", "--db", db_path, "127.0.0.1:1", "--email", "--escalate-after", "24"]
+                cert_monitor.main(argv)
+                cert_monitor.main(argv)
+
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]["To"], "manager@x.test")
+        self.assertIn("ESCALATION", sent[0]["Subject"])
+
+
+class AckCommandTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self.tmp.name) / "ack.db")
+        conn = storage.connect(self.db_path)
+        self.target_id = storage.upsert_target(conn, "example.com", 443)
+        storage.upsert_target(conn, "quiet.example", 443)
+        storage.record_alert(conn, self.target_id, "EXPIRED", "email", "2026-01-01T00:00:00+00:00")
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_acknowledges_open_alert(self):
+        with mock.patch("sys.stdout"):
+            code = cert_monitor.main(["ack", "example.com", "--by", "alice", "--note", "OPS-1", "--db", self.db_path])
+        self.assertEqual(code, 0)
+        conn = storage.connect(self.db_path)
+        ack = storage.current_ack(conn, self.target_id, "EXPIRED", "2026-01-01T00:00:00+00:00")
+        conn.close()
+        self.assertEqual((ack["acked_by"], ack["note"]), ("alice", "OPS-1"))
+
+    def test_refuses_when_nothing_is_open(self):
+        for target in ("quiet.example", "unknown.example"):
+            with mock.patch("sys.stderr"):
+                self.assertEqual(cert_monitor.main(["ack", target, "--by", "alice", "--db", self.db_path]), 2)
+
+
+class AlertedAtMigrationTests(unittest.TestCase):
+    def test_phase3_alert_state_gets_a_timestamp(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "phase3.db")
+            legacy = sqlite3.connect(db_path)
+            legacy.executescript(
+                "CREATE TABLE targets (id INTEGER PRIMARY KEY, hostname TEXT NOT NULL, port INTEGER NOT NULL, "
+                "created_at TEXT NOT NULL DEFAULT '', UNIQUE (hostname, port));"
+                "CREATE TABLE alert_state (target_id INTEGER NOT NULL, channel TEXT NOT NULL, "
+                "alert_key TEXT NOT NULL, PRIMARY KEY (target_id, channel));"
+                "INSERT INTO targets (hostname, port) VALUES ('example.com', 443);"
+                "INSERT INTO alert_state VALUES (1, 'slack', 'EXPIRED');"
+            )
+            legacy.commit()
+            legacy.close()
+
+            conn = storage.connect(db_path)
+            key, since = storage.active_alert(conn, 1)
+            conn.close()
+        self.assertEqual(key, "EXPIRED")
+        self.assertLess(datetime.now(timezone.utc) - datetime.fromisoformat(since), timedelta(minutes=1))
+
+
 class PruneTests(unittest.TestCase):
     def setUp(self):
         self.conn = storage.connect(":memory:")

@@ -7,6 +7,7 @@ import json
 import secrets
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from functools import wraps
 
 from flask import (
     Flask,
@@ -56,12 +57,29 @@ def _fmt_time(value: str | None) -> str:
     return datetime.fromisoformat(value).astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
+def _alert_label(key: str) -> str:
+    status, _, tier = key.partition(":")
+    if status == "EXPIRING_SOON":
+        return f"{tier}-day expiry warning" if tier else "Expiry warning"
+    return STATUS_LABELS.get(status, key)
+
+
 def _safe_next(target: str | None) -> str:
     # Only follow local paths after login; "//host" and "/\host" are treated
     # by browsers as links to another site.
     if target and target.startswith("/") and not target.startswith("//") and "\\" not in target:
         return target
     return url_for("index")
+
+
+def require_admin(view):
+    @wraps(view)
+    def wrapper(*args, **kwargs):
+        if g.user is None or g.user["role"] != "admin":
+            abort(403, "Only admins can do this.")
+        return view(*args, **kwargs)
+
+    return wrapper
 
 
 def create_app(
@@ -82,6 +100,7 @@ def create_app(
     )
     app.jinja_env.filters["fmt_time"] = _fmt_time
     app.jinja_env.filters["status_label"] = lambda s: STATUS_LABELS.get(s, s)
+    app.jinja_env.filters["alert_label"] = _alert_label
     stale_after = timedelta(hours=stale_hours)
 
     def db():
@@ -104,8 +123,18 @@ def create_app(
         view["stale"] = datetime.now(timezone.utc) - checked_at > stale_after
         return view
 
+    def alert_info(target_id: int) -> dict | None:
+        active = storage.active_alert(db(), target_id)
+        if active is None:
+            return None
+        key, since = active
+        ack = storage.current_ack(db(), target_id, key, since)
+        return {"key": key, "since": since, "ack": dict(ack) if ack else None}
+
     def latest_views() -> list[dict]:
         rows = [to_view(r) for r in storage.latest_checks(db())]
+        for r in rows:
+            r["alert"] = alert_info(r["target_id"])
         rows.sort(
             key=lambda r: (
                 STATUS_ORDER.index(r["status"]),
@@ -206,8 +235,27 @@ def create_app(
             target=target_row,
             latest=history[0] if history else None,
             history=history,
+            alert=alert_info(target_row["id"]),
             alerts=storage.target_alerts(db(), target_row["id"], limit=50),
+            acks=storage.target_acks(db(), target_row["id"], limit=50),
         )
+
+    @app.post("/targets/<hostname>/<int:port>/ack")
+    @require_admin
+    def acknowledge(hostname, port):
+        target_row = storage.get_target(db(), hostname, port)
+        if target_row is None:
+            abort(404)
+        info = alert_info(target_row["id"])
+        # The form carries the alert it was shown for, so a click can't
+        # acknowledge a different alert that was raised after the page loaded.
+        if info is None or info["key"] != request.form.get("alert_key"):
+            abort(409, "This alert has changed since the page loaded. Reload the page and try again.")
+        note = request.form.get("note", "").strip()[:500] or None
+        acked_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        storage.record_ack(db(), target_row["id"], info["key"], g.user["username"], note, acked_at)
+        db().commit()
+        return redirect(url_for("target", hostname=hostname, port=port))
 
     @app.get("/api/status")
     def api_status():

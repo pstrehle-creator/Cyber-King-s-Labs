@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timezone
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS targets (
@@ -43,8 +44,19 @@ CREATE TABLE IF NOT EXISTS alert_state (
     target_id INTEGER NOT NULL REFERENCES targets(id),
     channel TEXT NOT NULL,
     alert_key TEXT NOT NULL,
+    alerted_at TEXT,
     PRIMARY KEY (target_id, channel)
 );
+
+CREATE TABLE IF NOT EXISTS acks (
+    id INTEGER PRIMARY KEY,
+    target_id INTEGER NOT NULL REFERENCES targets(id),
+    alert_key TEXT NOT NULL,
+    acked_by TEXT NOT NULL,
+    note TEXT,
+    acked_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_acks_target ON acks (target_id, id);
 
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY,
@@ -65,8 +77,24 @@ def connect(path: str) -> sqlite3.Connection:
     # WAL lets the dashboard read while a cron check is writing.
     conn.execute("PRAGMA journal_mode = WAL")
     conn.executescript(SCHEMA)
+    _add_alerted_at_column(conn)
     _migrate_phase2_alert_state(conn)
     return conn
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _add_alerted_at_column(conn: sqlite3.Connection) -> None:
+    """Phase 3 databases didn't record when each alert was sent. Existing
+    alerts are treated as sent now, so escalation timers start fresh."""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(alert_state)")}
+    if "alerted_at" in columns:
+        return
+    conn.execute("ALTER TABLE alert_state ADD COLUMN alerted_at TEXT")
+    conn.execute("UPDATE alert_state SET alerted_at = ?", (_utc_now_iso(),))
+    conn.commit()
 
 
 def _migrate_phase2_alert_state(conn: sqlite3.Connection) -> None:
@@ -78,9 +106,10 @@ def _migrate_phase2_alert_state(conn: sqlite3.Connection) -> None:
         return
     conn.execute(
         """
-        INSERT OR IGNORE INTO alert_state (target_id, channel, alert_key)
-        SELECT id, 'email', last_alert_key FROM targets WHERE last_alert_key IS NOT NULL
-        """
+        INSERT OR IGNORE INTO alert_state (target_id, channel, alert_key, alerted_at)
+        SELECT id, 'email', last_alert_key, ? FROM targets WHERE last_alert_key IS NOT NULL
+        """,
+        (_utc_now_iso(),),
     )
     conn.execute("UPDATE targets SET last_alert_key = NULL")
     conn.commit()
@@ -146,9 +175,56 @@ def record_alert(
         (target_id, alert_key, channel, sent_at),
     )
     conn.execute(
-        "INSERT OR REPLACE INTO alert_state (target_id, channel, alert_key) VALUES (?, ?, ?)",
-        (target_id, channel, alert_key),
+        "INSERT OR REPLACE INTO alert_state (target_id, channel, alert_key, alerted_at) VALUES (?, ?, ?, ?)",
+        (target_id, channel, alert_key, sent_at),
     )
+
+
+def active_alert(conn: sqlite3.Connection, target_id: int) -> tuple[str, str] | None:
+    """The alert currently open for a target, as (alert_key, first sent at),
+    based on the regular (non-escalation) channels."""
+    rows = conn.execute(
+        """
+        SELECT alert_key, alerted_at FROM alert_state
+        WHERE target_id = ? AND channel NOT LIKE '%:escalation'
+        ORDER BY alerted_at DESC
+        """,
+        (target_id,),
+    ).fetchall()
+    if not rows:
+        return None
+    key = rows[0]["alert_key"]
+    return key, min(r["alerted_at"] for r in rows if r["alert_key"] == key)
+
+
+def record_ack(
+    conn: sqlite3.Connection, target_id: int, alert_key: str, acked_by: str, note: str | None, acked_at: str
+) -> None:
+    conn.execute(
+        "INSERT INTO acks (target_id, alert_key, acked_by, note, acked_at) VALUES (?, ?, ?, ?, ?)",
+        (target_id, alert_key, acked_by, note, acked_at),
+    )
+
+
+def current_ack(
+    conn: sqlite3.Connection, target_id: int, alert_key: str, since: str
+) -> sqlite3.Row | None:
+    """The latest acknowledgement of this alert made since it was raised. An
+    ack from an earlier occurrence of the same problem doesn't count."""
+    return conn.execute(
+        """
+        SELECT * FROM acks
+        WHERE target_id = ? AND alert_key = ? AND acked_at >= ?
+        ORDER BY id DESC LIMIT 1
+        """,
+        (target_id, alert_key, since),
+    ).fetchone()
+
+
+def target_acks(conn: sqlite3.Connection, target_id: int, limit: int) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM acks WHERE target_id = ? ORDER BY id DESC LIMIT ?", (target_id, limit)
+    ).fetchall()
 
 
 def latest_checks(conn: sqlite3.Connection) -> list[sqlite3.Row]:

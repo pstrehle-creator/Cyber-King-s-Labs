@@ -111,7 +111,7 @@ There are two roles:
 | Role     | Can do                                                   |
 |----------|----------------------------------------------------------|
 | `viewer` | See everything on the dashboard and use the JSON API     |
-| `admin`  | Everything a viewer can, plus admin-only actions         |
+| `admin`  | Everything a viewer can, plus acknowledge alerts         |
 
 Manage accounts from the command line on the server:
 
@@ -205,6 +205,44 @@ your channel. Text taken from certificates is escaped before posting, so a
 hostile server can't put `@channel` pings or disguised links into your
 alerts.
 
+## Acknowledging and escalating alerts
+
+When an admin sees an alert and starts handling it, they **acknowledge**
+it. They can do that from the target's page on the dashboard (with an
+optional note, such as a ticket number) or from the command line:
+
+```bash
+python cert_monitor.py ack vpn.example.com --note "OPS-123, renewing today"
+```
+
+Acknowledging shows everyone who is handling the alert. It also stops the
+alert from being **escalated**. To turn escalation on, add
+`--escalate-after HOURS` to `check`:
+
+```bash
+export ESCALATION_EMAILS=it-manager@example.com
+export ESCALATION_SLACK_WEBHOOK_URL='https://hooks.slack.com/services/...'   # e.g. a #ops-escalations channel
+python cert_monitor.py check --targets-file targets.txt --email --slack --escalate-after 24
+```
+
+An alert is escalated when all of these are true:
+
+- **It's urgent:** the certificate is `EXPIRED`, `INVALID_CHAIN`, or
+  `UNREACHABLE`, or has `--escalate-within-days` (default 7) or fewer days
+  left. Earlier warnings, like the 30-day one, are never escalated.
+- **It's been waiting:** the regular alert went out at least
+  `--escalate-after` hours ago.
+- **Nobody has acknowledged it.**
+
+Escalations go through the same channels you enabled for regular alerts,
+but to the escalation contacts instead. Each alert is escalated once.
+
+An acknowledgement covers one alert at one stage. If a certificate moves
+on to its next expiry warning (say from 7 days to 3 days) and still hasn't
+been renewed, that's a new alert and needs a new acknowledgement.
+Similarly, if a problem clears up and later comes back, the old
+acknowledgement doesn't carry over.
+
 ## Running on a schedule (cron)
 
 Put the SMTP and Slack settings in a file that only you can read, so they're not in
@@ -218,6 +256,7 @@ export SMTP_PASSWORD=change-me
 export ALERT_FROM_EMAIL=alerts@example.com
 export ALERT_TO_EMAILS=admin1@example.com,admin2@example.com
 export SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...
+export ESCALATION_EMAILS=it-manager@example.com
 EOF
 chmod 600 ~/.cert-monitor.env
 ```
@@ -226,7 +265,7 @@ Then add a crontab entry with `crontab -e`:
 
 ```cron
 # every 6 hours; alerts are only sent when something changes
-0 */6 * * * . $HOME/.cert-monitor.env && cd /path/to/cert-monitor && ./venv/bin/python cert_monitor.py check --targets-file targets.txt --email --slack >> cert_monitor.log 2>&1
+0 */6 * * * . $HOME/.cert-monitor.env && cd /path/to/cert-monitor && ./venv/bin/python cert_monitor.py check --targets-file targets.txt --email --slack --escalate-after 24 >> cert_monitor.log 2>&1
 # weekly on Sunday at 3am, trim history older than 90 days
 0 3 * * 0 cd /path/to/cert-monitor && ./venv/bin/python cert_monitor.py prune --keep-days 90 >> cert_monitor.log 2>&1
 ```

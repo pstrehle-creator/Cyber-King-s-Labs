@@ -31,6 +31,32 @@
 </section>
 {% endif %}
 
+{% if alert %}
+<section class="panel">
+  <h2>Open alert: {{ alert.key|alert_label }}</h2>
+  <p class="muted">First sent {{ alert.since|fmt_time }}.</p>
+  {% if alert.ack %}
+  <p>
+    <span class="badge acked">Acknowledged</span>
+    by <strong>{{ alert.ack.acked_by }}</strong> at {{ alert.ack.acked_at|fmt_time }}{% if alert.ack.note %}: {{ alert.ack.note }}{% endif %}
+  </p>
+  {% elif g.user.role == 'admin' %}
+  <form method="post" action="{{ url_for('acknowledge', hostname=target.hostname, port=target.port) }}" class="ack-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="alert_key" value="{{ alert.key }}">
+    <label for="note">Note (optional)</label>
+    <div class="ack-row">
+      <input id="note" name="note" maxlength="500" placeholder="e.g. renewal ticket OPS-123">
+      <button type="submit">Acknowledge</button>
+    </div>
+    <p class="muted">Acknowledging tells others you're handling it and stops escalation for this alert.</p>
+  </form>
+  {% else %}
+  <p class="muted">Not acknowledged yet. An admin can acknowledge it to stop escalation.</p>
+  {% endif %}
+</section>
+{% endif %}
+
 <section>
   <h2>Check history</h2>
   <div class="table-wrap">
@@ -69,8 +95,8 @@
         {% for a in alerts %}
         <tr>
           <td class="nowrap">{{ a.sent_at|fmt_time }}</td>
-          <td>{{ a.alert_key }}</td>
-          <td>{{ a.channel }}</td>
+          <td>{{ a.alert_key|alert_label }}</td>
+          <td>{{ a.channel|replace(':escalation', ' (escalation)') }}</td>
         </tr>
         {% endfor %}
       </tbody>
@@ -80,4 +106,24 @@
   <p class="empty">No alerts sent for this target.</p>
   {% endif %}
 </section>
+{% if acks %}
+<section>
+  <h2>Acknowledgements</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>When</th><th>Alert</th><th>By</th><th>Note</th></tr></thead>
+      <tbody>
+        {% for a in acks %}
+        <tr>
+          <td class="nowrap">{{ a.acked_at|fmt_time }}</td>
+          <td>{{ a.alert_key|alert_label }}</td>
+          <td>{{ a.acked_by }}</td>
+          <td class="detail">{{ a.note or '—' }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endif %}
 {% endblock %}
