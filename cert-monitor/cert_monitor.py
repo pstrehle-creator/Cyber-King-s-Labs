@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-cert_monitor.py - Phase 1 CLI for the TLS/SSL certificate monitoring app.
+cert_monitor.py - CLI for the TLS/SSL certificate monitoring app.
 
-Checks a list of host[:port] targets, reports days remaining until each
-certificate expires, and (optionally) emails admins when any target is
-expiring soon, expired, unreachable, or failing chain validation.
+Checks a list of host[:port] targets, records every result in SQLite, and
+(optionally) emails admins when a target newly needs attention: it crosses
+an expiry tier, expires, becomes unreachable, or fails chain validation.
 
 Usage:
-    python cert_monitor.py example.com github.com:443
-    python cert_monitor.py --targets-file targets.txt --threshold 14 --email
+    python cert_monitor.py check example.com github.com:443
+    python cert_monitor.py check --targets-file targets.txt --email
+    python cert_monitor.py history
+    python cert_monitor.py history example.com --limit 10
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ import json
 import os
 import smtplib
 import socket
+import sqlite3
 import ssl
 import sys
 from dataclasses import asdict, dataclass, field
@@ -27,12 +30,19 @@ from pathlib import Path
 
 from cryptography import x509
 
+import storage
+
 DEFAULT_PORT = 443
 DEFAULT_THRESHOLD_DAYS = 30
+DEFAULT_ALERT_TIERS = [30, 14, 7, 3, 1]
 DEFAULT_TIMEOUT = 5.0
+DEFAULT_DB_PATH = "cert_monitor.db"
 
-ALERT_STATUSES = {"EXPIRED", "EXPIRING_SOON", "UNREACHABLE", "INVALID_CHAIN"}
 FAILURE_STATUSES = {"EXPIRED", "UNREACHABLE", "INVALID_CHAIN"}
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 @dataclass
@@ -49,6 +59,7 @@ class CertCheckResult:
     serial_number: str | None = None
     chain_valid: bool = True
     error: str | None = None
+    checked_at: str = field(default_factory=_utc_now_iso)
 
     @property
     def target(self) -> str:
@@ -76,9 +87,8 @@ def split_target(raw: str) -> tuple[str, int]:
 
 
 def _fetch_cert_der(hostname: str, port: int, timeout: float) -> bytes:
-    """Open a TLS connection without verifying the chain, purely to retrieve
-    the peer's certificate bytes for parsing. Chain trust is checked
-    separately in _check_chain_valid()."""
+    """Retrieve the peer certificate without verifying it, so expired or
+    untrusted certs can still be parsed. Trust is checked in _check_chain_valid()."""
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -88,15 +98,13 @@ def _fetch_cert_der(hostname: str, port: int, timeout: float) -> bytes:
 
 
 def _check_chain_valid(hostname: str, port: int, timeout: float) -> tuple[bool, str | None]:
-    """Attempt a fully verified handshake (hostname + trust chain) and report
-    whether it succeeds."""
     ctx = ssl.create_default_context()
     try:
         with socket.create_connection((hostname, port), timeout=timeout) as sock:
             with ctx.wrap_socket(sock, server_hostname=hostname):
                 return True, None
     except ssl.SSLCertVerificationError as exc:
-        return False, str(exc)
+        return False, exc.verify_message or str(exc)
 
 
 def _cert_not_after_utc(cert: x509.Certificate) -> datetime:
@@ -122,7 +130,8 @@ def _san_dns_names(cert: x509.Certificate) -> list[str]:
 def check_target(hostname: str, port: int, timeout: float, threshold: int) -> CertCheckResult:
     try:
         der = _fetch_cert_der(hostname, port, timeout)
-    except (socket.timeout, socket.gaierror, ConnectionRefusedError, OSError) as exc:
+        chain_valid, chain_error = _check_chain_valid(hostname, port, timeout)
+    except OSError as exc:
         return CertCheckResult(hostname=hostname, port=port, status="UNREACHABLE", error=str(exc))
 
     if der is None:
@@ -130,17 +139,16 @@ def check_target(hostname: str, port: int, timeout: float, threshold: int) -> Ce
             hostname=hostname, port=port, status="UNREACHABLE", error="peer presented no certificate"
         )
 
-    chain_valid, chain_error = _check_chain_valid(hostname, port, timeout)
-
     cert = x509.load_der_x509_certificate(der)
     not_after = _cert_not_after_utc(cert)
     not_before = _cert_not_before_utc(cert)
     days_remaining = (not_after - datetime.now(timezone.utc)).days
 
-    if not chain_valid:
-        status = "INVALID_CHAIN"
-    elif days_remaining < 0:
+    # Expired certs also fail chain verification, so check expiry first.
+    if days_remaining < 0:
         status = "EXPIRED"
+    elif not chain_valid:
+        status = "INVALID_CHAIN"
     elif days_remaining <= threshold:
         status = "EXPIRING_SOON"
     else:
@@ -162,18 +170,49 @@ def check_target(hostname: str, port: int, timeout: float, threshold: int) -> Ce
     )
 
 
-def print_table(results: list[CertCheckResult]) -> None:
-    header = f"{'TARGET':<32} {'STATUS':<15} {'DAYS':>6}  {'NOT AFTER':<26} ISSUER"
+def alert_key(result: CertCheckResult, tiers: list[int]) -> str | None:
+    """Identify the alert state a result is in. An admin is emailed once each
+    time a target's key changes, not on every run."""
+    if result.status == "OK":
+        return None
+    if result.status == "EXPIRING_SOON":
+        tier = min((t for t in tiers if result.days_remaining <= t), default=None)
+        return f"EXPIRING_SOON:{tier}" if tier is not None else "EXPIRING_SOON"
+    return result.status
+
+
+def find_new_alerts(
+    conn: sqlite3.Connection, checked: list[tuple[int, CertCheckResult]], tiers: list[int]
+) -> list[tuple[int, CertCheckResult, str]]:
+    new_alerts = []
+    for target_id, result in checked:
+        key = alert_key(result, tiers)
+        if key is None:
+            # Recovered (e.g. renewed): reset so the next problem alerts again.
+            storage.clear_last_alert_key(conn, target_id)
+        elif key != storage.get_last_alert_key(conn, target_id):
+            new_alerts.append((target_id, result, key))
+    return new_alerts
+
+
+def print_table(rows: list[dict], show_time: bool = False) -> None:
+    targets = [f"{r['hostname']}:{r['port']}" for r in rows]
+    width = max([len("TARGET"), *map(len, targets)])
+    time_col = f"{'CHECKED AT':<26} " if show_time else ""
+    header = f"{time_col}{'TARGET':<{width}} {'STATUS':<15} {'DAYS':>6}  {'NOT AFTER':<26} ISSUER / ERROR"
     print(header)
     print("-" * len(header))
-    for r in sorted(results, key=lambda r: (r.days_remaining is None, r.days_remaining)):
-        days = "?" if r.days_remaining is None else str(r.days_remaining)
-        not_after = r.not_after or "-"
-        issuer = r.issuer or (r.error or "-")
-        print(f"{r.target:<32} {r.status:<15} {days:>6}  {not_after:<26} {issuer}")
+    for target, r in zip(targets, rows):
+        time_val = f"{r['checked_at']:<26} " if show_time else ""
+        days = "?" if r["days_remaining"] is None else str(r["days_remaining"])
+        detail = r["error"] if r["status"] != "OK" and r["error"] else (r["issuer"] or "-")
+        print(
+            f"{time_val}{target:<{width}} {r['status']:<15} {days:>6}  "
+            f"{r['not_after'] or '-':<26} {detail}"
+        )
 
 
-def send_alert_email(results: list[CertCheckResult]) -> None:
+def send_alert_email(alerts: list[tuple[CertCheckResult, str]]) -> bool:
     smtp_host = os.environ.get("SMTP_HOST")
     smtp_port = int(os.environ.get("SMTP_PORT", "587"))
     smtp_user = os.environ.get("SMTP_USER")
@@ -192,73 +231,147 @@ def send_alert_email(results: list[CertCheckResult]) -> None:
     ]
     if missing:
         print(f"[warn] skipping email alert, missing env vars: {', '.join(missing)}", file=sys.stderr)
-        return
+        return False
 
-    lines = [f"{r.target}: {r.status} (days_remaining={r.days_remaining}, error={r.error})" for r in results]
+    lines = []
+    for r, key in alerts:
+        line = f"- {r.target}: {key}"
+        if r.days_remaining is not None:
+            line += f" ({r.days_remaining} days remaining, expires {r.not_after})"
+        if r.error:
+            line += f"\n    {r.error}"
+        lines.append(line)
     body = "The following certificates need attention:\n\n" + "\n".join(lines)
 
     msg = EmailMessage()
-    msg["Subject"] = f"[cert-monitor] {len(results)} certificate(s) need attention"
+    msg["Subject"] = f"[cert-monitor] {len(alerts)} certificate(s) need attention"
     msg["From"] = from_addr
     msg["To"] = ", ".join(to_addrs)
     msg.set_content(body)
 
-    with smtplib.SMTP(smtp_host, smtp_port, timeout=10) as server:
-        server.starttls()
-        if smtp_user and smtp_password:
-            server.login(smtp_user, smtp_password)
-        server.send_message(msg)
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=10) as server:
+            server.starttls()
+            if smtp_user and smtp_password:
+                server.login(smtp_user, smtp_password)
+            server.send_message(msg)
+    except (smtplib.SMTPException, OSError) as exc:
+        print(f"[error] failed to send alert email, will retry next run: {exc}", file=sys.stderr)
+        return False
+
     print(f"[info] alert email sent to {', '.join(to_addrs)}")
+    return True
 
 
-def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Check TLS certificate expiry for a list of targets.")
-    parser.add_argument("targets", nargs="*", help="host or host:port targets to check")
-    parser.add_argument("--targets-file", type=Path, help="file with one host[:port] per line")
-    parser.add_argument(
-        "--threshold", type=int, default=DEFAULT_THRESHOLD_DAYS,
-        help="days remaining considered 'expiring soon' (default: 30)",
-    )
-    parser.add_argument(
-        "--timeout", type=float, default=DEFAULT_TIMEOUT,
-        help="connection timeout in seconds (default: 5)",
-    )
-    parser.add_argument("--email", action="store_true", help="send an email alert if any target needs attention")
-    parser.add_argument("--json-out", type=Path, help="write full results as JSON to this path")
-    return parser
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = build_arg_parser()
-    args = parser.parse_args(argv)
-
+def cmd_check(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
     raw_targets = list(args.targets)
     if args.targets_file:
         raw_targets.extend(parse_targets_file(args.targets_file))
-
     if not raw_targets:
-        parser.error("no targets given (pass targets as arguments or via --targets-file)")
+        args.parser.error("no targets given (pass targets as arguments or via --targets-file)")
 
-    results = [
-        check_target(*split_target(raw), timeout=args.timeout, threshold=args.threshold)
-        for raw in raw_targets
-    ]
+    checked = []
+    for raw in raw_targets:
+        hostname, port = split_target(raw)
+        result = check_target(hostname, port, timeout=args.timeout, threshold=args.threshold)
+        target_id = storage.upsert_target(conn, hostname, port)
+        storage.record_check(conn, target_id, result)
+        checked.append((target_id, result))
+    conn.commit()
 
-    print_table(results)
+    results = sorted(
+        (r for _, r in checked), key=lambda r: (r.days_remaining is None, r.days_remaining)
+    )
+    print_table([asdict(r) for r in results])
 
     if args.json_out:
         args.json_out.write_text(json.dumps([asdict(r) for r in results], indent=2))
         print(f"[info] wrote results to {args.json_out}")
 
-    needs_attention = [r for r in results if r.status in ALERT_STATUSES]
-    if needs_attention and args.email:
-        send_alert_email(needs_attention)
+    new_alerts = find_new_alerts(conn, checked, args.alert_tiers)
+    conn.commit()
+    if new_alerts and args.email:
+        if send_alert_email([(r, key) for _, r, key in new_alerts]):
+            sent_at = _utc_now_iso()
+            for target_id, _, key in new_alerts:
+                storage.record_alert(conn, target_id, key, "email", sent_at)
+            conn.commit()
 
     if any(r.status in FAILURE_STATUSES for r in results):
         return 2
     if any(r.status == "EXPIRING_SOON" for r in results):
         return 1
     return 0
+
+
+def cmd_history(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
+    if args.target:
+        hostname, port = split_target(args.target)
+        rows = storage.target_history(conn, hostname, port, args.limit)
+        if not rows:
+            print(f"no checks recorded for {hostname}:{port}")
+            return 0
+        print_table([dict(r) for r in rows], show_time=True)
+    else:
+        rows = storage.latest_checks(conn)
+        if not rows:
+            print("no checks recorded yet; run the 'check' command first")
+            return 0
+        print_table([dict(r) for r in rows], show_time=True)
+    return 0
+
+
+def _parse_tiers(value: str) -> list[int]:
+    try:
+        return sorted({int(v) for v in value.split(",") if v.strip()}, reverse=True)
+    except ValueError:
+        raise argparse.ArgumentTypeError("tiers must be comma-separated integers, e.g. 30,14,7")
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Monitor TLS certificate expiry.")
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--db", default=DEFAULT_DB_PATH, help=f"SQLite database path (default: {DEFAULT_DB_PATH})"
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    check = subparsers.add_parser("check", parents=[common], help="check targets and record results")
+    check.add_argument("targets", nargs="*", help="host or host:port targets to check")
+    check.add_argument("--targets-file", type=Path, help="file with one host[:port] per line")
+    check.add_argument(
+        "--threshold", type=int, default=DEFAULT_THRESHOLD_DAYS,
+        help="days remaining considered 'expiring soon' (default: 30)",
+    )
+    check.add_argument(
+        "--alert-tiers", type=_parse_tiers, default=DEFAULT_ALERT_TIERS,
+        help="days-remaining tiers that each trigger one email (default: 30,14,7,3,1)",
+    )
+    check.add_argument(
+        "--timeout", type=float, default=DEFAULT_TIMEOUT,
+        help="connection timeout in seconds (default: 5)",
+    )
+    check.add_argument("--email", action="store_true", help="email admins about new alerts")
+    check.add_argument("--json-out", type=Path, help="write full results as JSON to this path")
+    check.set_defaults(func=cmd_check, parser=check)
+
+    history = subparsers.add_parser(
+        "history", parents=[common], help="show recorded results (latest per target, or one target's history)"
+    )
+    history.add_argument("target", nargs="?", help="host or host:port to show history for")
+    history.add_argument("--limit", type=int, default=20, help="max rows for one target (default: 20)")
+    history.set_defaults(func=cmd_history)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_arg_parser().parse_args(argv)
+    conn = storage.connect(args.db)
+    try:
+        return args.func(args, conn)
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":
